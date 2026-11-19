@@ -1,0 +1,31 @@
+# Local toolchains & downloaded/built binaries
+.tools/
+bin/*
+!bin/.gitkeep
+*.exe
+*.exe~
+*~
+
+# Personal configuration, backups & Blue Iris exports (contain camera credentials)
+/config.yaml
+/config.*.yaml
+/config.local.yaml
+!/configs/config.example.yaml
+*.bak
+*.reg
+go2rtc.runtime.yaml
+go2rtc*.yaml
+
+# Runtime data, databases, logs & recorded video clips
+data/
+recordings/
+*.db
+*.db-*
+*.log
+*.tmp
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

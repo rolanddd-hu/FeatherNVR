@@ -1,0 +1,1965 @@
+import { VideoRTC } from '/go2rtc/video-rtc.js';
+
+class FeatherNVRPlayer extends VideoRTC {
+  set statusText(val) {
+    if (!this.statusEl) return;
+    this.statusEl.textContent = val || '';
+    this.statusEl.classList.toggle('hidden', !val);
+  }
+
+  set errorText(val) {
+    if (!this.statusEl) return;
+    const raw = String(val || '');
+    const lower = raw.toLowerCase();
+    let msg = raw;
+    if (lower.includes('codecs not matched') || lower.includes('h265') || lower.includes('hevc')) {
+      msg = 'HEVC unsupported in this browser (use Edge/Chrome or set sub-stream to H.264)';
+    }
+    this.statusEl.textContent = msg;
+    this.statusEl.classList.add('error');
+    this.statusEl.classList.remove('hidden');
+  }
+
+  oninit() {
+    super.oninit();
+    this.video.autoplay = true;
+    this.video.playsInline = true;
+    this.video.controls = false;
+    if (this.hasAttribute('grid')) {
+      this.video.muted = true;
+    }
+    this.video.style.objectFit = 'contain';
+    this.video.style.background = '#000';
+
+    this.statusEl = document.createElement('div');
+    this.statusEl.className = 'player-status hidden';
+    this.appendChild(this.statusEl);
+  }
+
+  onconnect() {
+    const ok = super.onconnect();
+    if (ok && this.statusEl) {
+      this.statusEl.classList.remove('error', 'playing');
+      this.statusText = 'Loading...';
+    }
+    return ok;
+  }
+
+  ondisconnect() {
+    super.ondisconnect();
+    if (this.statusEl) {
+      this.statusEl.classList.remove('error', 'playing');
+      this.statusText = '';
+    }
+  }
+
+  onopen() {
+    const modes = super.onopen();
+    this.onmessage['feathernvr'] = (msg) => {
+      switch (msg.type) {
+        case 'error':
+          if (this.statusEl && !this.statusEl.classList.contains('playing')) {
+            this.errorText = msg.value;
+          }
+          break;
+        case 'mse':
+        case 'hls':
+        case 'mp4':
+        case 'mjpeg':
+          if (this.statusEl) {
+            this.statusEl.classList.remove('error');
+            this.statusEl.classList.add('playing');
+          }
+          this.statusText = msg.type.toUpperCase();
+          break;
+      }
+    };
+    return modes;
+  }
+
+  onpcvideo(video2) {
+    super.onpcvideo(video2);
+    if (this.pcState !== WebSocket.CLOSED && this.statusEl) {
+      this.statusEl.classList.remove('error');
+      this.statusEl.classList.add('playing');
+      this.statusText = 'RTC';
+    }
+  }
+}
+
+if (!customElements.get('feathernvr-player')) {
+  customElements.define('feathernvr-player', FeatherNVRPlayer);
+}
+
+function loadStoredCameraOrder() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('feathernvr_cam_order') || '[]');
+    if (Array.isArray(raw)) {
+      return raw.filter((v) => typeof v === 'string' && v.trim() !== '');
+    }
+  } catch {}
+  return [];
+}
+
+const state = {
+  cameras: [],
+  storage: null,
+  uptimeSec: 0,
+  gridCols: localStorage.getItem('feathernvr_cols_v2') || 'fit',
+  cameraOrder: loadStoredCameraOrder(),
+  editLayout: false,
+  swapSelectedCam: null,
+  tiles: new Map(), // camID -> { el, stage, zoomCtrl, player, dot, recBadge, motBadge, ptzBadge, metaLeft, metaRight }
+  activeModalCam: null,
+  activeModalQuality: 'sub',
+  modalPlayer: null,
+  liveZoomCtrl: null,
+  ptzPanelExpanded: true,
+  activePtzBtn: null,
+  recOffset: 0,
+  recLimit: 40,
+  recTotal: 0,
+  daySession: null,
+  clipZoomCtrl: null,
+  statusTimer: null,
+  recCameraPopulated: false,
+};
+
+const qs = (sel) => document.querySelector(sel);
+
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return '0 MB';
+  const gb = bytes / (1024 * 1024 * 1024);
+  if (gb >= 1) return `${gb.toFixed(2)} GB`;
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+function formatDuration(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function formatUnix(ts) {
+  if (!ts) return '--';
+  return new Date(ts * 1000).toLocaleString();
+}
+
+function formatClockTime(unixSec) {
+  if (!unixSec) return '--:--:--';
+  return new Date(unixSec * 1000).toLocaleTimeString([], {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function formatHM(unixSec) {
+  if (!unixSec) return '--:--';
+  return new Date(unixSec * 1000).toLocaleTimeString([], {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function formatMMSS(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function escapeHTML(str) {
+  return String(str ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[ch]));
+}
+
+function wsStreamURL(streamName) {
+  return `/go2rtc/api/ws?src=${encodeURIComponent(streamName)}`;
+}
+
+function isMobileViewport() {
+  return window.matchMedia('(pointer: coarse)').matches
+    || window.matchMedia('(hover: none)').matches
+    || window.matchMedia('(max-width: 767px)').matches;
+}
+
+// Pan & Zoom controller (desktop only): wheel zoom [1.0, 8.0] (never < 1:1), drag pan when zoomed, tap callback when unmoved.
+function createPanZoomController(viewportEl, stageEl, badgeEl, opts = {}) {
+  const MIN_SCALE = 1;
+  const MAX_SCALE = 8;
+  let scale = 1;
+  let tx = 0;
+  let ty = 0;
+
+  function clampTransform(nextScale, nextTx, nextTy) {
+    const s = Math.min(MAX_SCALE, Math.max(MIN_SCALE, nextScale));
+    if (s <= 1.001) {
+      return { scale: 1, tx: 0, ty: 0 };
+    }
+    const rect = viewportEl.getBoundingClientRect();
+    const maxTx = Math.max(0, (rect.width * (s - 1)) / 2);
+    const maxTy = Math.max(0, (rect.height * (s - 1)) / 2);
+    return {
+      scale: s,
+      tx: Math.max(-maxTx, Math.min(maxTx, nextTx)),
+      ty: Math.max(-maxTy, Math.min(maxTy, nextTy)),
+    };
+  }
+
+  function apply() {
+    const zoomed = scale > 1.001;
+    stageEl.style.transform = zoomed
+      ? `translate(${tx.toFixed(1)}px, ${ty.toFixed(1)}px) scale(${scale.toFixed(3)})`
+      : '';
+    viewportEl.classList.toggle('zoomed', zoomed);
+    if (badgeEl) {
+      badgeEl.classList.toggle('hidden', !zoomed);
+      if (zoomed) {
+        badgeEl.textContent = `${scale.toFixed(1)}x · Reset`;
+      }
+    }
+  }
+
+  function reset() {
+    scale = 1;
+    tx = 0;
+    ty = 0;
+    viewportEl.classList.remove('panning');
+    apply();
+  }
+
+  function zoomAround(targetScale, clientX, clientY) {
+    const rect = viewportEl.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = clientX - cx;
+    const dy = clientY - cy;
+
+    const clampedScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, targetScale));
+    const ratio = scale > 0 ? clampedScale / scale : 1;
+    const nextTx = dx * (1 - ratio) + tx * ratio;
+    const nextTy = dy * (1 - ratio) + ty * ratio;
+    const clamped = clampTransform(clampedScale, nextTx, nextTy);
+    scale = clamped.scale;
+    tx = clamped.tx;
+    ty = clamped.ty;
+    apply();
+  }
+
+  viewportEl.addEventListener('wheel', (ev) => {
+    if (isMobileViewport() || opts.isDisabled?.()) return;
+    if (opts.allowPageScrollAt1x?.() && scale <= 1.001 && ev.deltaY > 0) {
+      return;
+    }
+    ev.preventDefault();
+    ev.stopPropagation();
+
+    const rect = viewportEl.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    let dy = ev.deltaY;
+    if (ev.deltaMode === 1) dy *= 16;
+    else if (ev.deltaMode === 2) dy *= rect.height;
+
+    const factor = Math.exp(-dy * 0.0022);
+    let nextScale = scale * factor;
+    if (dy > 0 && nextScale < 1.02) nextScale = 1;
+    zoomAround(nextScale, ev.clientX, ev.clientY);
+  }, { passive: false });
+
+  if (badgeEl) {
+    badgeEl.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      reset();
+    });
+    badgeEl.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+    badgeEl.addEventListener('pointerup', (ev) => ev.stopPropagation());
+  }
+
+  const touchState = {
+    activeIds: new Set(),
+    startX: 0,
+    startY: 0,
+    moved: false,
+    multi: false,
+  };
+  let mouseGesture = null;
+
+  viewportEl.addEventListener('pointerdown', (ev) => {
+    if (opts.isDisabled?.()) return;
+    if (ev.target.closest?.('.zoom-badge')) return;
+
+    if (ev.pointerType === 'touch' || isMobileViewport()) {
+      touchState.activeIds.add(ev.pointerId);
+      if (touchState.activeIds.size === 1) {
+        touchState.startX = ev.clientX;
+        touchState.startY = ev.clientY;
+        touchState.moved = false;
+        touchState.multi = false;
+      } else {
+        touchState.multi = true;
+      }
+      return;
+    }
+
+    if (ev.button > 0) return;
+    try { viewportEl.setPointerCapture(ev.pointerId); } catch {}
+    mouseGesture = {
+      pointerId: ev.pointerId,
+      startX: ev.clientX,
+      startY: ev.clientY,
+      startTx: tx,
+      startTy: ty,
+      moved: false,
+    };
+  });
+
+  viewportEl.addEventListener('pointermove', (ev) => {
+    if (opts.isDisabled?.()) return;
+
+    if (ev.pointerType === 'touch' || isMobileViewport()) {
+      if (!touchState.activeIds.has(ev.pointerId)) return;
+      if (touchState.activeIds.size === 1 && !touchState.moved) {
+        const dx = ev.clientX - touchState.startX;
+        const dy = ev.clientY - touchState.startY;
+        if (Math.hypot(dx, dy) > 10) {
+          touchState.moved = true;
+        }
+      }
+      return;
+    }
+
+    if (!mouseGesture || mouseGesture.pointerId !== ev.pointerId) return;
+    const dx = ev.clientX - mouseGesture.startX;
+    const dy = ev.clientY - mouseGesture.startY;
+    if (Math.hypot(dx, dy) > 5) {
+      mouseGesture.moved = true;
+      if (scale > 1.001) {
+        viewportEl.classList.add('panning');
+        const clamped = clampTransform(scale, mouseGesture.startTx + dx, mouseGesture.startTy + dy);
+        tx = clamped.tx;
+        ty = clamped.ty;
+        apply();
+      }
+    }
+  });
+
+  function finishPointer(ev, cancelled) {
+    if (touchState.activeIds.has(ev.pointerId)) {
+      touchState.activeIds.delete(ev.pointerId);
+      if (touchState.activeIds.size === 0) {
+        const shouldTap = !cancelled && !touchState.moved && !touchState.multi && !opts.isDisabled?.();
+        touchState.moved = false;
+        touchState.multi = false;
+        if (shouldTap && opts.onTap) {
+          opts.onTap(ev);
+        }
+      }
+      return;
+    }
+
+    if (!mouseGesture || mouseGesture.pointerId !== ev.pointerId) return;
+    try { viewportEl.releasePointerCapture(ev.pointerId); } catch {}
+    viewportEl.classList.remove('panning');
+    const shouldTap = !cancelled && !mouseGesture.moved && !opts.isDisabled?.();
+    mouseGesture = null;
+    if (shouldTap && opts.onTap) {
+      opts.onTap(ev);
+    }
+  }
+
+  viewportEl.addEventListener('pointerup', (ev) => finishPointer(ev, false));
+  viewportEl.addEventListener('pointercancel', (ev) => finishPointer(ev, true));
+
+  window.addEventListener('resize', () => {
+    if (isMobileViewport() && scale > 1.001) {
+      reset();
+    }
+  });
+
+  function reclamp() {
+    if (isMobileViewport()) {
+      reset();
+      return;
+    }
+    const clamped = clampTransform(scale, tx, ty);
+    scale = clamped.scale;
+    tx = clamped.tx;
+    ty = clamped.ty;
+    apply();
+  }
+
+  return {
+    reset,
+    reclamp,
+    getScale: () => scale,
+    apply,
+  };
+}
+
+// Tabs
+function switchTab(tabName) {
+  document.querySelectorAll('.nav-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.tab === tabName);
+  });
+  document.querySelectorAll('.tab-panel').forEach((panel) => {
+    panel.classList.toggle('active', panel.id === `tab-${tabName}`);
+  });
+  syncBodyFitMode();
+  if (tabName === 'live') {
+    requestAnimationFrame(updateFitLayout);
+  }
+  if (tabName === 'recordings') {
+    loadRecordings(false);
+  }
+}
+
+document.querySelectorAll('.nav-btn').forEach((btn) => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
+
+function syncBodyFitMode() {
+  const liveActive = Boolean(qs('#tab-live')?.classList.contains('active'));
+  const fitActive = liveActive && state.gridCols === 'fit';
+  document.body.classList.toggle('fit-mode', fitActive);
+  qs('.main-content')?.classList.toggle('fit-mode', fitActive);
+}
+
+function updateFitLayout() {
+  syncBodyFitMode();
+  const grid = qs('#camera-grid');
+  if (!grid) return;
+  const liveActive = Boolean(qs('#tab-live')?.classList.contains('active'));
+  if (state.gridCols !== 'fit' || !liveActive) {
+    grid.style.gridTemplateColumns = '';
+    grid.style.gridTemplateRows = '';
+    return;
+  }
+  const count = state.cameras.length || grid.children.length;
+  if (!count) return;
+  const w = grid.clientWidth;
+  const h = grid.clientHeight;
+  if (w <= 0 || h <= 0) return;
+
+  const gap = parseFloat(getComputedStyle(grid).columnGap) || 6;
+  const aspect = 16 / 9;
+  let bestCols = 1;
+  let bestRows = count;
+  let bestArea = -1;
+
+  for (let cols = 1; cols <= count; cols++) {
+    const rows = Math.ceil(count / cols);
+    const cellW = (w - gap * (cols - 1)) / cols;
+    const cellH = (h - gap * (rows - 1)) / rows;
+    if (cellW <= 0 || cellH <= 0) continue;
+    const vidW = Math.min(cellW, cellH * aspect);
+    const vidH = vidW / aspect;
+    const area = vidW * vidH;
+    if (area > bestArea + 0.5) {
+      bestArea = area;
+      bestCols = cols;
+      bestRows = rows;
+    }
+  }
+
+  grid.style.gridTemplateColumns = `repeat(${bestCols}, minmax(0, 1fr))`;
+  grid.style.gridTemplateRows = `repeat(${bestRows}, minmax(0, 1fr))`;
+}
+
+// Grid columns
+function applyGridCols(cols) {
+  state.gridCols = cols;
+  localStorage.setItem('feathernvr_cols_v2', cols);
+  const grid = qs('#camera-grid');
+  grid.className = `camera-grid cols-${cols}`;
+  grid.classList.toggle('editing', state.editLayout);
+  document.querySelectorAll('.col-selector .chip').forEach((c) => {
+    c.classList.toggle('active', c.dataset.cols === cols);
+  });
+  updateFitLayout();
+  requestAnimationFrame(updateFitLayout);
+}
+
+document.querySelectorAll('.col-selector .chip').forEach((c) => {
+  c.addEventListener('click', () => applyGridCols(c.dataset.cols));
+});
+window.addEventListener('resize', updateFitLayout);
+if (window.ResizeObserver && qs('.main-content')) {
+  new ResizeObserver(updateFitLayout).observe(qs('.main-content'));
+}
+applyGridCols(state.gridCols);
+
+// Camera layout order & Edit Layout mode
+function getEffectiveOrder(cameras) {
+  const present = new Set((cameras || []).map((c) => c.id));
+  const out = [];
+  const seen = new Set();
+  for (const id of state.cameraOrder) {
+    if (present.has(id) && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  for (const c of cameras || []) {
+    if (!seen.has(c.id)) {
+      seen.add(c.id);
+      out.push(c.id);
+    }
+  }
+  return out;
+}
+
+function applyCameraOrder() {
+  const order = getEffectiveOrder(state.cameras);
+  order.forEach((id, idx) => {
+    const ref = state.tiles.get(id);
+    if (ref) {
+      ref.el.style.order = String(idx);
+    }
+  });
+}
+
+async function loadLayoutSettings() {
+  try {
+    const res = await fetch('/api/settings/layout', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (Array.isArray(data.camera_order) && data.camera_order.length > 0) {
+      state.cameraOrder = data.camera_order;
+      localStorage.setItem('feathernvr_cam_order', JSON.stringify(state.cameraOrder));
+      applyCameraOrder();
+    }
+  } catch {}
+}
+
+async function saveLayoutSettings() {
+  try {
+    localStorage.setItem('feathernvr_cam_order', JSON.stringify(state.cameraOrder));
+  } catch {}
+  try {
+    await fetch('/api/settings/layout', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ camera_order: state.cameraOrder }),
+    });
+  } catch {}
+}
+
+function clearSwapSelection() {
+  if (!state.swapSelectedCam) return;
+  const prev = state.tiles.get(state.swapSelectedCam);
+  prev?.el.classList.remove('swap-selected');
+  state.swapSelectedCam = null;
+}
+
+function swapCameras(idA, idB) {
+  if (!idA || !idB || idA === idB) return;
+  const order = getEffectiveOrder(state.cameras);
+  const idxA = order.indexOf(idA);
+  const idxB = order.indexOf(idB);
+  if (idxA < 0 || idxB < 0) return;
+  [order[idxA], order[idxB]] = [order[idxB], order[idxA]];
+  state.cameraOrder = order;
+  applyCameraOrder();
+  saveLayoutSettings();
+}
+
+function setEditLayout(enabled) {
+  state.editLayout = !!enabled;
+  clearSwapSelection();
+  const grid = qs('#camera-grid');
+  grid?.classList.toggle('editing', state.editLayout);
+  const btnEdit = qs('#btn-edit-layout');
+  if (btnEdit) {
+    btnEdit.classList.toggle('active', state.editLayout);
+    btnEdit.textContent = state.editLayout ? 'Done Editing' : 'Edit Layout';
+  }
+  qs('#btn-reset-layout')?.classList.toggle('hidden', !state.editLayout);
+  if (state.editLayout) {
+    for (const ref of state.tiles.values()) {
+      ref.zoomCtrl?.reset();
+    }
+  }
+}
+
+qs('#btn-edit-layout')?.addEventListener('click', () => setEditLayout(!state.editLayout));
+qs('#btn-reset-layout')?.addEventListener('click', () => {
+  clearSwapSelection();
+  state.cameraOrder = state.cameras.map((c) => c.id);
+  applyCameraOrder();
+  saveLayoutSettings();
+});
+
+function attachTileDragHandlers(tile, cam) {
+  tile.addEventListener('pointerdown', (ev) => {
+    if (!state.editLayout || ev.button > 0) return;
+    ev.preventDefault();
+
+    const drag = {
+      srcID: cam.id,
+      startX: ev.clientX,
+      startY: ev.clientY,
+      dragging: false,
+      ghost: null,
+      hoverTile: null,
+    };
+
+    function clearHover() {
+      if (drag.hoverTile) {
+        drag.hoverTile.classList.remove('drop-target');
+        drag.hoverTile = null;
+      }
+    }
+
+    function onMove(moveEv) {
+      const dx = moveEv.clientX - drag.startX;
+      const dy = moveEv.clientY - drag.startY;
+      if (!drag.dragging && Math.hypot(dx, dy) > 6) {
+        drag.dragging = true;
+        clearSwapSelection();
+        tile.classList.add('dragging');
+        const ghost = document.createElement('div');
+        ghost.className = 'drag-ghost';
+        ghost.textContent = cam.name || cam.id;
+        document.body.appendChild(ghost);
+        drag.ghost = ghost;
+      }
+      if (!drag.dragging) return;
+
+      drag.ghost.style.left = `${moveEv.clientX + 12}px`;
+      drag.ghost.style.top = `${moveEv.clientY + 12}px`;
+
+      const hit = document.elementsFromPoint(moveEv.clientX, moveEv.clientY)
+        .find((el) => el.classList?.contains('cam-tile') && el !== tile);
+      if (hit !== drag.hoverTile) {
+        clearHover();
+        if (hit) {
+          hit.classList.add('drop-target');
+          drag.hoverTile = hit;
+        }
+      }
+    }
+
+    function cleanup() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      tile.classList.remove('dragging');
+      if (drag.ghost) {
+        drag.ghost.remove();
+        drag.ghost = null;
+      }
+      const target = drag.hoverTile;
+      clearHover();
+      return target;
+    }
+
+    function onUp() {
+      const target = cleanup();
+      if (drag.dragging) {
+        if (target?.dataset.camId) {
+          swapCameras(drag.srcID, target.dataset.camId);
+        }
+        return;
+      }
+      // Tap/click fallback in Edit Layout mode: tap first camera, then tap second camera to swap.
+      if (!state.swapSelectedCam) {
+        state.swapSelectedCam = drag.srcID;
+        tile.classList.add('swap-selected');
+      } else if (state.swapSelectedCam === drag.srcID) {
+        clearSwapSelection();
+      } else {
+        const first = state.swapSelectedCam;
+        clearSwapSelection();
+        swapCameras(first, drag.srcID);
+      }
+    }
+
+    function onCancel() {
+      cleanup();
+    }
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+  });
+}
+
+// Build/update live grid without tearing down existing video players
+function syncLiveGrid(cameras) {
+  const grid = qs('#camera-grid');
+  const nextIDs = cameras.map((c) => c.id);
+  const changed = nextIDs.length !== state.tiles.size || nextIDs.some((id) => !state.tiles.has(id));
+
+  if (changed) {
+    clearSwapSelection();
+    for (const ref of state.tiles.values()) {
+      if (typeof ref.player.ondisconnect === 'function') {
+        ref.player.ondisconnect();
+      }
+    }
+    state.tiles.clear();
+    grid.innerHTML = '';
+
+    for (const cam of cameras) {
+      const tile = document.createElement('div');
+      tile.className = 'cam-tile';
+      tile.dataset.camId = cam.id;
+
+      const stage = document.createElement('div');
+      stage.className = 'zoom-stage';
+
+      const player = document.createElement('feathernvr-player');
+      player.setAttribute('grid', '');
+      player.pcConfig = { bundlePolicy: 'max-bundle', iceServers: [] };
+      player.mode = 'webrtc,mse,hls,mjpeg';
+      player.media = 'video';
+      player.visibilityThreshold = 0.15;
+      player.visibilityCheck = true;
+
+      stage.appendChild(player);
+
+      const ovTop = document.createElement('div');
+      ovTop.className = 'cam-overlay-top';
+      ovTop.innerHTML = `
+        <div class="cam-title">
+          <span class="dot"></span>
+          <span class="name-text">${escapeHTML(cam.name)}</span>
+        </div>
+        <div class="cam-badges">
+          <span class="edit-drag-hint">&#8942;&#8942; Swap</span>
+          <span class="badge ptz hidden">PTZ</span>
+          <span class="badge motion hidden">MOT</span>
+          <span class="badge rec hidden">REC</span>
+        </div>
+      `;
+
+      const ovBottom = document.createElement('div');
+      ovBottom.className = 'cam-overlay-bottom';
+      ovBottom.innerHTML = `
+        <span class="meta-left">--</span>
+        <span class="meta-right">--</span>
+      `;
+
+      const zoomBadge = document.createElement('button');
+      zoomBadge.type = 'button';
+      zoomBadge.className = 'zoom-badge hidden';
+      zoomBadge.textContent = '1.0x · Reset';
+
+      tile.appendChild(stage);
+      tile.appendChild(ovTop);
+      tile.appendChild(ovBottom);
+      tile.appendChild(zoomBadge);
+
+      const zoomCtrl = createPanZoomController(tile, stage, zoomBadge, {
+        isDisabled: () => state.editLayout,
+        allowPageScrollAt1x: () => state.gridCols !== 'fit',
+        onTap: () => {
+          if (!state.editLayout) {
+            openLiveModal(cam.id);
+          }
+        },
+      });
+      attachTileDragHandlers(tile, cam);
+
+      grid.appendChild(tile);
+
+      // Set src after connecting to DOM so isConnected is true.
+      player.src = wsStreamURL(cam.stream_sub);
+
+      state.tiles.set(cam.id, {
+        el: tile,
+        stage,
+        zoomCtrl,
+        player,
+        dot: ovTop.querySelector('.dot'),
+        ptzBadge: ovTop.querySelector('.badge.ptz'),
+        recBadge: ovTop.querySelector('.badge.rec'),
+        motBadge: ovTop.querySelector('.badge.motion'),
+        metaLeft: ovBottom.querySelector('.meta-left'),
+        metaRight: ovBottom.querySelector('.meta-right'),
+      });
+    }
+    applyCameraOrder();
+    requestAnimationFrame(updateFitLayout);
+  } else {
+    applyCameraOrder();
+  }
+
+  let onlineCount = 0;
+  let recCount = 0;
+  for (const cam of cameras) {
+    if (cam.online) onlineCount++;
+    if (cam.recording) recCount++;
+
+    const ref = state.tiles.get(cam.id);
+    if (!ref) continue;
+    ref.dot.classList.toggle('online', !!cam.online);
+    ref.ptzBadge.classList.toggle('hidden', !cam.ptz_enabled);
+    ref.recBadge.classList.toggle('hidden', !cam.recording);
+    ref.motBadge.classList.toggle('hidden', !cam.motion_active);
+    ref.metaLeft.textContent = cam.online ? `${cam.fps.toFixed(1)} fps · ${cam.bitrate_kbps.toFixed(0)} kbps` : 'Offline';
+    ref.metaRight.textContent = cam.motion_mode || '';
+  }
+
+  qs('#live-summary').textContent = `${onlineCount}/${cameras.length} online` + (recCount > 0 ? ` · ${recCount} recording` : '');
+
+  if (state.activeModalCam) {
+    const cam = cameras.find((c) => c.id === state.activeModalCam);
+    if (cam) {
+      qs('#modal-live-dot').classList.toggle('online', !!cam.online);
+      qs('#modal-live-rec').classList.toggle('hidden', !cam.recording);
+    }
+  }
+}
+
+function renderStatusTab(data) {
+  const st = data.storage || {};
+  const pct = Math.min(100, Math.max(0, st.percent || 0));
+  qs('#status-storage-bar').style.width = `${pct.toFixed(1)}%`;
+  qs('#status-storage-used').textContent = `${formatBytes(st.used_bytes)} / ${formatBytes(st.max_bytes)} (${pct.toFixed(1)}%)`;
+  qs('#status-storage-clips').textContent = String(st.recording_count ?? 0);
+  qs('#status-storage-oldest').textContent = formatUnix(st.oldest_time);
+  qs('#status-uptime').textContent = formatDuration(data.uptime_sec);
+  qs('#top-storage-pill').textContent = `${formatBytes(st.used_bytes)} / ${formatBytes(st.max_bytes)}`;
+
+  const tbody = qs('#diag-tbody');
+  tbody.innerHTML = '';
+  for (const cam of data.cameras || []) {
+    const tr = document.createElement('tr');
+    const score = Number(cam.motion_score || 0).toFixed(2);
+    const motionLabel = cam.motion_active
+      ? `${escapeHTML(cam.motion_mode)} (ACTIVE ${score}%)`
+      : `${escapeHTML(cam.motion_mode)} (${score}%)`;
+    tr.innerHTML = `
+      <td><strong>${escapeHTML(cam.name)}</strong><div class="muted small">${escapeHTML(cam.id)}</div></td>
+      <td>${cam.online ? '<span style="color:var(--ok)">Online</span>' : '<span style="color:var(--danger)">Offline</span>'}${cam.recording ? ' · <span style="color:var(--danger)">REC</span>' : ''}</td>
+      <td>${cam.bitrate_kbps.toFixed(0)} kbps</td>
+      <td>${cam.fps.toFixed(1)}</td>
+      <td>${motionLabel}</td>
+      <td>${cam.reconnects}</td>
+      <td class="err-cell" title="${escapeHTML(cam.last_error || '')}">${escapeHTML(cam.last_error || '-')}</td>
+      <td><button class="btn btn-secondary btn-sm">Trigger</button></td>
+    `;
+    tr.querySelector('button').addEventListener('click', () => triggerCamera(cam.id));
+    tbody.appendChild(tr);
+  }
+}
+
+function populateRecCameras(cameras) {
+  if (state.recCameraPopulated || !cameras.length) return;
+  state.recCameraPopulated = true;
+  const sel = qs('#rec-camera');
+  for (const cam of cameras) {
+    const opt = document.createElement('option');
+    opt.value = cam.id;
+    opt.textContent = cam.name;
+    sel.appendChild(opt);
+  }
+}
+
+async function pollStatus() {
+  try {
+    const res = await fetch('/api/status', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    state.cameras = data.cameras || [];
+    state.storage = data.storage || null;
+    state.uptimeSec = data.uptime_sec || 0;
+
+    qs('#server-dot').classList.add('ok');
+    syncLiveGrid(state.cameras);
+    renderStatusTab(data);
+    populateRecCameras(state.cameras);
+  } catch (err) {
+    qs('#server-dot').classList.remove('ok');
+  }
+}
+
+function isStreamFullscreen(modalEl) {
+  const card = modalEl?.querySelector('.modal-card');
+  if (!card) return false;
+  if (card.classList.contains('stream-only-fs')) return true;
+  return Boolean(document.fullscreenElement && (document.fullscreenElement === card || modalEl.contains(document.fullscreenElement)));
+}
+
+function enterStreamFullscreen(modalEl) {
+  const card = modalEl?.querySelector('.modal-card');
+  if (!card) return;
+  card.classList.add('stream-only-fs');
+  if (card.requestFullscreen && !document.fullscreenElement) {
+    card.requestFullscreen().catch(() => {});
+  }
+  requestAnimationFrame(() => {
+    state.liveZoomCtrl?.reclamp();
+    state.clipZoomCtrl?.reclamp();
+  });
+}
+
+function exitStreamFullscreen(modalEl) {
+  const card = modalEl?.querySelector('.modal-card');
+  card?.classList.remove('stream-only-fs');
+  if (document.fullscreenElement && modalEl && (document.fullscreenElement === card || modalEl.contains(document.fullscreenElement))) {
+    document.exitFullscreen().catch(() => {});
+  }
+  requestAnimationFrame(() => {
+    state.liveZoomCtrl?.reclamp();
+    state.clipZoomCtrl?.reclamp();
+  });
+}
+
+function toggleStreamFullscreen(modalEl) {
+  if (isStreamFullscreen(modalEl)) {
+    exitStreamFullscreen(modalEl);
+  } else {
+    enterStreamFullscreen(modalEl);
+  }
+}
+
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement) {
+    qs('#live-modal .modal-card')?.classList.remove('stream-only-fs');
+    qs('#clip-modal .modal-card')?.classList.remove('stream-only-fs');
+  }
+  requestAnimationFrame(() => {
+    state.liveZoomCtrl?.reclamp();
+    state.clipZoomCtrl?.reclamp();
+  });
+});
+
+// Single-camera modal
+if (qs('#modal-live-player-wrap') && qs('#modal-live-zoom-stage')) {
+  state.liveZoomCtrl = createPanZoomController(
+    qs('#modal-live-player-wrap'),
+    qs('#modal-live-zoom-stage'),
+    qs('#live-zoom-badge'),
+    {
+      onTap: () => {
+        const modal = qs('#live-modal');
+        if (isStreamFullscreen(modal)) {
+          exitStreamFullscreen(modal);
+        } else {
+          closeLiveModal();
+        }
+      },
+    },
+  );
+}
+
+function openLiveModal(camID) {
+  const cam = state.cameras.find((c) => c.id === camID);
+  if (!cam) return;
+  state.activeModalCam = camID;
+  state.activeModalQuality = 'sub';
+  state.ptzPanelExpanded = true;
+
+  qs('#modal-live-title').textContent = cam.name;
+  qs('#modal-live-dot').classList.toggle('online', !!cam.online);
+  qs('#modal-live-rec').classList.toggle('hidden', !cam.recording);
+  qs('#live-modal').classList.remove('hidden');
+
+  loadModalPTZ(cam);
+  mountModalStream();
+}
+
+function mountModalStream() {
+  const cam = state.cameras.find((c) => c.id === state.activeModalCam);
+  if (!cam) return;
+
+  destroyModalPlayer();
+  state.liveZoomCtrl?.reset();
+
+  const streamName = state.activeModalQuality === 'main' ? cam.stream_main : cam.stream_sub;
+  qs('#btn-stream-sub').classList.toggle('active', state.activeModalQuality === 'sub');
+  qs('#btn-stream-main').classList.toggle('active', state.activeModalQuality === 'main');
+  qs('#btn-modal-snap').href = `/go2rtc/api/frame.jpeg?src=${encodeURIComponent(streamName)}`;
+  qs('#btn-modal-snap').download = `${cam.id}_${Date.now()}.jpg`;
+
+  const stage = qs('#modal-live-zoom-stage');
+  const player = document.createElement('feathernvr-player');
+  player.pcConfig = { bundlePolicy: 'max-bundle', iceServers: [] };
+  player.mode = 'webrtc,mse,hls,mjpeg';
+  player.media = 'video,audio';
+  player.visibilityThreshold = 0;
+  player.visibilityCheck = true;
+  stage.appendChild(player);
+
+  if (player.video) {
+    player.video.muted = true;
+  }
+  qs('#btn-modal-mute').textContent = 'Unmute';
+  player.src = wsStreamURL(streamName);
+  state.modalPlayer = player;
+}
+
+function destroyModalPlayer() {
+  if (state.modalPlayer) {
+    if (typeof state.modalPlayer.ondisconnect === 'function') {
+      state.modalPlayer.ondisconnect();
+    }
+    state.modalPlayer.remove();
+    state.modalPlayer = null;
+  }
+  const stage = qs('#modal-live-zoom-stage');
+  if (stage) stage.innerHTML = '';
+}
+
+function closeLiveModal() {
+  exitStreamFullscreen(qs('#live-modal'));
+  state.liveZoomCtrl?.reset();
+  stopActivePTZ();
+  state.activeModalCam = null;
+  destroyModalPlayer();
+  qs('#modal-ptz-panel')?.classList.add('hidden');
+  qs('#btn-modal-ptz-toggle')?.classList.add('hidden');
+  if (qs('#modal-ptz-presets')) qs('#modal-ptz-presets').innerHTML = '';
+  qs('#live-modal').classList.add('hidden');
+}
+
+function setPTZStatus(text) {
+  const el = qs('#ptz-status');
+  if (el) el.textContent = text || '';
+}
+
+function loadModalPTZ(cam) {
+  const panel = qs('#modal-ptz-panel');
+  const toggleBtn = qs('#btn-modal-ptz-toggle');
+  const presetsEl = qs('#modal-ptz-presets');
+  setPTZStatus('');
+  if (presetsEl) presetsEl.innerHTML = '';
+  if (!cam?.ptz_enabled) {
+    panel?.classList.add('hidden');
+    toggleBtn?.classList.add('hidden');
+    return;
+  }
+  toggleBtn?.classList.remove('hidden');
+  toggleBtn?.classList.toggle('active', state.ptzPanelExpanded);
+  panel?.classList.toggle('hidden', !state.ptzPanelExpanded);
+  loadPTZPresets(cam.id);
+}
+
+qs('#btn-modal-ptz-toggle')?.addEventListener('click', () => {
+  state.ptzPanelExpanded = !state.ptzPanelExpanded;
+  qs('#modal-ptz-panel')?.classList.toggle('hidden', !state.ptzPanelExpanded);
+  qs('#btn-modal-ptz-toggle')?.classList.toggle('active', state.ptzPanelExpanded);
+});
+
+async function loadPTZPresets(camID) {
+  const box = qs('#modal-ptz-presets');
+  if (!box) return;
+  box.innerHTML = '<span class="muted small">Loading...</span>';
+  try {
+    const res = await fetch(`/api/cameras/${encodeURIComponent(camID)}/ptz/presets`, { cache: 'no-store' });
+    if (state.activeModalCam !== camID) return;
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      box.innerHTML = '';
+      setPTZStatus(errData.error || `Presets HTTP ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    if (state.activeModalCam !== camID) return;
+    const presets = (data.presets || []).slice(0, 32);
+    box.innerHTML = '';
+    if (!presets.length) {
+      box.innerHTML = '<span class="muted small">None</span>';
+      return;
+    }
+    for (const p of presets) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ptz-preset-btn';
+      btn.textContent = p.name || p.id;
+      btn.addEventListener('click', () => gotoPTZPreset(camID, p.id, btn.textContent));
+      box.appendChild(btn);
+    }
+  } catch (err) {
+    if (state.activeModalCam !== camID) return;
+    box.innerHTML = '';
+    setPTZStatus(err.message);
+  }
+}
+
+async function ptzMove(camID, pan, tilt, zoom, durationMS) {
+  setPTZStatus('');
+  try {
+    const res = await fetch(`/api/cameras/${encodeURIComponent(camID)}/ptz/move`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pan, tilt, zoom, duration_ms: durationMS }),
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      setPTZStatus(errData.error || `PTZ error ${res.status}`);
+    }
+  } catch (err) {
+    setPTZStatus(err.message);
+  }
+}
+
+async function ptzStop(camID) {
+  if (!camID) return;
+  if (state.ptzMovePromise) {
+    await state.ptzMovePromise.catch(() => {});
+  }
+  try {
+    await fetch(`/api/cameras/${encodeURIComponent(camID)}/ptz/stop`, { method: 'POST' });
+  } catch {}
+}
+
+async function gotoPTZPreset(camID, presetID, label) {
+  setPTZStatus(`Moving to ${label}...`);
+  try {
+    const res = await fetch(`/api/cameras/${encodeURIComponent(camID)}/ptz/presets/${encodeURIComponent(presetID)}`, {
+      method: 'POST',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setPTZStatus(data.error || `Preset HTTP ${res.status}`);
+      return;
+    }
+    setPTZStatus(`Preset: ${label}`);
+  } catch (err) {
+    setPTZStatus(err.message);
+  }
+}
+
+function stopActivePTZ() {
+  if (!state.activePtzBtn) return;
+  state.activePtzBtn.classList.remove('moving');
+  state.activePtzBtn = null;
+  if (state.activeModalCam) {
+    ptzStop(state.activeModalCam);
+  }
+}
+
+qs('#ptz-speed')?.addEventListener('input', (ev) => {
+  const valEl = qs('#ptz-speed-val');
+  if (valEl) valEl.textContent = `${Math.round(Number(ev.target.value) * 100)}%`;
+});
+
+qs('#btn-ptz-stop')?.addEventListener('click', () => {
+  state.activePtzBtn?.classList.remove('moving');
+  state.activePtzBtn = null;
+  if (state.activeModalCam) ptzStop(state.activeModalCam);
+});
+
+document.querySelectorAll('#modal-ptz-panel [data-pan], #modal-ptz-panel [data-zoom]').forEach((btn) => {
+  btn.addEventListener('pointerdown', (ev) => {
+    if (!state.activeModalCam || ev.button > 0) return;
+    ev.preventDefault();
+    if (state.activePtzBtn && state.activePtzBtn !== btn) {
+      state.activePtzBtn.classList.remove('moving');
+    }
+    const speed = Number(qs('#ptz-speed')?.value || 0.6);
+    const pan = Number(btn.dataset.pan || 0) * speed;
+    const tilt = Number(btn.dataset.tilt || 0) * speed;
+    const zoom = Number(btn.dataset.zoom || 0) * speed;
+    state.activePtzBtn = btn;
+    btn.classList.add('moving');
+    try { btn.setPointerCapture(ev.pointerId); } catch {}
+    state.ptzMovePromise = ptzMove(state.activeModalCam, pan, tilt, zoom, 4500);
+  });
+  btn.addEventListener('pointerup', stopActivePTZ);
+  btn.addEventListener('pointercancel', stopActivePTZ);
+  btn.addEventListener('lostpointercapture', stopActivePTZ);
+  btn.addEventListener('click', (ev) => {
+    // Keyboard activation fallback (Enter/Space) sends a short nudge.
+    if (ev.detail === 0 && state.activeModalCam) {
+      const speed = Number(qs('#ptz-speed')?.value || 0.6);
+      const pan = Number(btn.dataset.pan || 0) * speed;
+      const tilt = Number(btn.dataset.tilt || 0) * speed;
+      const zoom = Number(btn.dataset.zoom || 0) * speed;
+      state.ptzMovePromise = ptzMove(state.activeModalCam, pan, tilt, zoom, 350);
+    }
+  });
+});
+
+window.addEventListener('blur', stopActivePTZ);
+
+qs('#btn-stream-sub').addEventListener('click', () => {
+  state.activeModalQuality = 'sub';
+  mountModalStream();
+});
+
+qs('#btn-stream-main').addEventListener('click', () => {
+  state.activeModalQuality = 'main';
+  mountModalStream();
+});
+
+qs('#btn-modal-mute').addEventListener('click', () => {
+  const v = state.modalPlayer?.video;
+  if (!v) return;
+  v.muted = !v.muted;
+  qs('#btn-modal-mute').textContent = v.muted ? 'Unmute' : 'Mute';
+});
+
+qs('#btn-modal-fs').addEventListener('click', () => {
+  toggleStreamFullscreen(qs('#live-modal'));
+});
+
+qs('#btn-modal-rec').addEventListener('click', async () => {
+  if (state.activeModalCam) {
+    await triggerCamera(state.activeModalCam);
+    pollStatus();
+  }
+});
+
+async function triggerCamera(camID) {
+  await fetch(`/api/cameras/${encodeURIComponent(camID)}/trigger`, { method: 'POST' });
+}
+
+// Recordings tab (grouped per camera per day)
+async function loadRecordings(append) {
+  if (!append) {
+    state.recOffset = 0;
+  }
+  const params = new URLSearchParams({
+    limit: String(state.recLimit),
+    offset: String(state.recOffset),
+  });
+  const cam = qs('#rec-camera').value;
+  const date = qs('#rec-date').value;
+  if (cam) params.set('camera', cam);
+  if (date) params.set('date', date);
+
+  const listEl = qs('#recordings-list');
+  if (!append) {
+    listEl.innerHTML = '<div class="muted">Loading clips...</div>';
+  }
+
+  const res = await fetch(`/api/recordings/days?${params.toString()}`, { cache: 'no-store' });
+  if (!res.ok) {
+    listEl.innerHTML = '<div class="muted">Failed to load recordings.</div>';
+    return;
+  }
+  const data = await res.json();
+  const items = data.days || [];
+  state.recTotal = data.total || 0;
+
+  if (!append) {
+    listEl.innerHTML = '';
+  }
+
+  if (!append && items.length === 0) {
+    listEl.innerHTML = '<div class="muted">No motion clips found for the selected filter.</div>';
+  }
+
+  for (const day of items) {
+    const card = document.createElement('div');
+    card.className = 'rec-card';
+    const thumbHTML = day.thumb_url
+      ? `<img loading="lazy" src="${escapeHTML(day.thumb_url)}" alt="">`
+      : `<div class="muted small">No thumbnail</div>`;
+    card.innerHTML = `
+      <div class="rec-thumb-wrap">
+        ${thumbHTML}
+        <span class="rec-trigger-pill">${escapeHTML(day.date)}</span>
+        <span class="rec-dur-pill">${day.clip_count} clip(s) &middot; ${escapeHTML(formatDuration(day.total_duration_sec))}</span>
+      </div>
+      <div class="rec-body">
+        <div class="rec-title">${escapeHTML(day.camera_name || day.camera_id)}</div>
+        <div class="rec-sub">
+          <span>${escapeHTML(formatClockTime(day.first_start_time))} &ndash; ${escapeHTML(formatClockTime(day.last_end_time))}</span>
+          <span>${formatBytes(day.total_size_bytes)}</span>
+        </div>
+      </div>
+    `;
+    card.addEventListener('click', () => openDayModal(day));
+    listEl.appendChild(card);
+  }
+
+  const shown = state.recOffset + items.length;
+  qs('#rec-count-label').textContent = `${state.recTotal} camera-day(s)`;
+  qs('#rec-load-more').classList.toggle('hidden', shown >= state.recTotal);
+}
+
+qs('#rec-camera').addEventListener('change', () => loadRecordings(false));
+qs('#rec-date').addEventListener('change', () => loadRecordings(false));
+qs('#rec-refresh').addEventListener('click', () => loadRecordings(false));
+qs('#rec-clear-date').addEventListener('click', () => {
+  qs('#rec-date').value = '';
+  loadRecordings(false);
+});
+qs('#rec-load-more').addEventListener('click', () => {
+  state.recOffset += state.recLimit;
+  loadRecordings(true);
+});
+
+if (qs('#modal-clip-player-wrap') && qs('#modal-clip-zoom-stage')) {
+  state.clipZoomCtrl = createPanZoomController(
+    qs('#modal-clip-player-wrap'),
+    qs('#modal-clip-zoom-stage'),
+    qs('#clip-zoom-badge'),
+    {
+      onTap: () => {
+        const modal = qs('#clip-modal');
+        if (isStreamFullscreen(modal)) {
+          exitStreamFullscreen(modal);
+        } else {
+          closeClipModal();
+        }
+      },
+    },
+  );
+}
+
+async function openDayModal(day) {
+  const params = new URLSearchParams({
+    camera: day.camera_id,
+    date: day.date,
+  });
+  const res = await fetch(`/api/recordings/day?${params.toString()}`, { cache: 'no-store' });
+  if (!res.ok) {
+    alert('Failed to load day recordings.');
+    return;
+  }
+  const data = await res.json();
+  const clips = data.clips || [];
+  if (!clips.length) {
+    alert('No clips found for this day.');
+    loadRecordings(false);
+    return;
+  }
+
+  state.daySession = {
+    camera_id: data.camera_id,
+    camera_name: data.camera_name || day.camera_name || day.camera_id,
+    date: data.date,
+    day_start: data.day_start,
+    day_end: data.day_end,
+    tlViewStart: data.day_start,
+    tlViewEnd: data.day_end,
+    clips,
+    index: 0,
+    tlMode: '24h',
+    playbackRate: Number(qs('#clip-speed')?.value || 1),
+    pendingSeek: 0,
+    pendingAutoplay: true,
+  };
+
+  state.clipZoomCtrl?.reset();
+  qs('#clip-modal').classList.remove('hidden');
+  renderDayTimeline();
+  playDayClip(0, 0, true);
+}
+
+function getTimelineWindow(session) {
+  if (!session) return { winStart: 0, winEnd: 86400 };
+  const clips = session.clips || [];
+  if (session.tlMode === 'fit' && clips.length > 0) {
+    const firstStart = clips[0].start_time;
+    const lastEnd = clips.reduce(
+      (mx, c) => Math.max(mx, c.end_time || 0, c.start_time + Math.round(c.duration_sec || 1)),
+      firstStart,
+    );
+    const span = Math.max(60, lastEnd - firstStart);
+    const pad = Math.max(300, Math.round(span * 0.08));
+    let winStart = Math.max(session.day_start, firstStart - pad);
+    let winEnd = Math.min(session.day_end, lastEnd + pad);
+    if (winEnd - winStart < 600 && (session.day_end - session.day_start) >= 600) {
+      const center = (winStart + winEnd) / 2;
+      winStart = Math.max(session.day_start, Math.floor(center - 300));
+      winEnd = Math.min(session.day_end, winStart + 600);
+      winStart = Math.max(session.day_start, winEnd - 600);
+    }
+    return { winStart, winEnd };
+  }
+  return {
+    winStart: session.tlViewStart ?? session.day_start,
+    winEnd: session.tlViewEnd ?? session.day_end,
+  };
+}
+
+function renderDayTimeline() {
+  const session = state.daySession;
+  if (!session) return;
+  const { winStart, winEnd } = getTimelineWindow(session);
+  const span = Math.max(1, winEnd - winStart);
+
+  document.querySelectorAll('[data-tl-mode]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.tlMode === session.tlMode);
+  });
+
+  const fullSpan = Math.max(1, session.day_end - session.day_start);
+  const zoomed24h = session.tlMode === '24h' && span < fullSpan - 1;
+  const resetBtn = qs('#btn-tl-reset-zoom');
+  if (resetBtn) {
+    resetBtn.classList.toggle('hidden', !zoomed24h);
+    if (zoomed24h) {
+      resetBtn.textContent = `${formatDuration(span)} · Reset`;
+    }
+  }
+
+  const segsEl = qs('#day-timeline-segs');
+  segsEl.innerHTML = '';
+  session.clips.forEach((clip, idx) => {
+    const cStart = clip.start_time;
+    const cEnd = Math.max(clip.end_time || 0, clip.start_time + Math.round(clip.duration_sec || 1));
+    const visStart = Math.max(winStart, cStart);
+    const visEnd = Math.min(winEnd, cEnd);
+    if (visEnd <= visStart) return;
+
+    const leftPct = ((visStart - winStart) / span) * 100;
+    const widthPct = ((visEnd - visStart) / span) * 100;
+
+    const seg = document.createElement('div');
+    seg.className = 'tl-seg' + (idx === session.index ? ' active' : '');
+    seg.dataset.clipIndex = String(idx);
+    seg.style.left = `${leftPct}%`;
+    seg.style.width = `${Math.max(0.25, widthPct)}%`;
+    segsEl.appendChild(seg);
+  });
+
+  const ticksEl = qs('#day-timeline-ticks');
+  ticksEl.innerHTML = '';
+  const tickCount = session.tlMode === '24h' ? 6 : 4;
+  for (let i = 0; i <= tickCount; i++) {
+    const ratio = i / tickCount;
+    const t = Math.round(winStart + ratio * span);
+    const tick = document.createElement('span');
+    tick.className = 'tl-tick';
+    tick.style.left = `${ratio * 100}%`;
+    if (session.tlMode === '24h' && i === tickCount && Math.abs(winEnd - session.day_end) < 1) {
+      tick.textContent = '24:00';
+    } else if (span <= 3600) {
+      tick.textContent = formatClockTime(t);
+    } else {
+      tick.textContent = formatHM(t);
+    }
+    ticksEl.appendChild(tick);
+  }
+
+  updateDayPlayhead();
+}
+
+function updateClipPlayButtons() {
+  const video = qs('#modal-clip-video');
+  const session = state.daySession;
+  const playBtn = qs('#btn-clip-play');
+  const pausedPill = qs('#clip-paused-pill');
+  if (!video || !playBtn) return;
+
+  const atEnd = Boolean(session && video.ended && session.index >= session.clips.length - 1);
+  if (atEnd) {
+    playBtn.textContent = 'Replay';
+    pausedPill?.classList.add('hidden');
+  } else if (video.paused) {
+    playBtn.textContent = 'Play';
+    pausedPill?.classList.remove('hidden');
+  } else {
+    playBtn.textContent = 'Pause';
+    pausedPill?.classList.add('hidden');
+  }
+
+  if (session) {
+    qs('#btn-clip-prev').disabled = session.index <= 0;
+    qs('#btn-clip-next').disabled = session.index >= session.clips.length - 1;
+  }
+}
+
+function updateDayPlayhead(overrideUnix = null) {
+  const session = state.daySession;
+  const playhead = qs('#day-timeline-playhead');
+  if (!session || !session.clips.length) {
+    playhead?.classList.add('hidden');
+    return;
+  }
+
+  const clip = session.clips[session.index];
+  const video = qs('#modal-clip-video');
+  const cur = Number.isFinite(video?.currentTime) ? video.currentTime : 0;
+  const dur = Number.isFinite(video?.duration) && video.duration > 0 ? video.duration : (clip.duration_sec || 0);
+  const wallUnix = overrideUnix ?? (clip.start_time + cur);
+
+  qs('#tl-current-time').textContent = formatClockTime(wallUnix);
+  qs('#clip-time-readout').textContent = `${formatMMSS(cur)} / ${formatMMSS(dur)}`;
+
+  const { winStart, winEnd } = getTimelineWindow(session);
+  const span = Math.max(1, winEnd - winStart);
+  if (playhead) {
+    if (wallUnix < winStart || wallUnix > winEnd) {
+      playhead.classList.add('hidden');
+    } else {
+      const pct = ((wallUnix - winStart) / span) * 100;
+      playhead.classList.remove('hidden');
+      playhead.style.left = `${pct}%`;
+    }
+  }
+}
+
+function playDayClip(index, offsetSec = 0, autoplay = true) {
+  const session = state.daySession;
+  if (!session || !session.clips.length) return;
+  index = Math.max(0, Math.min(session.clips.length - 1, index));
+  session.index = index;
+  session.pendingSeek = Math.max(0, offsetSec || 0);
+  session.pendingAutoplay = Boolean(autoplay);
+
+  const clip = session.clips[index];
+  qs('#modal-clip-title').textContent = `${session.camera_name || session.camera_id} · ${session.date}`;
+  qs('#modal-clip-meta').textContent =
+    `Clip ${index + 1}/${session.clips.length} · ${formatClockTime(clip.start_time)}–${formatClockTime(clip.end_time)} · ${clip.trigger_source || 'motion'} · ${formatBytes(clip.size_bytes)}`;
+  qs('#tl-clip-range').textContent = `Clip ${index + 1} of ${session.clips.length}`;
+  qs('#btn-clip-download').href = clip.video_url;
+  qs('#btn-clip-download').download = clip.file_path.split('/').pop() || 'clip.mp4';
+
+  qs('#day-timeline-segs')?.querySelectorAll('.tl-seg').forEach((seg) => {
+    seg.classList.toggle('active', Number(seg.dataset.clipIndex) === index);
+  });
+
+  const video = qs('#modal-clip-video');
+  video.playbackRate = session.playbackRate || 1;
+  video.src = clip.video_url;
+  video.load();
+  updateClipPlayButtons();
+  updateDayPlayhead();
+}
+
+function findClipForUnix(session, unix) {
+  const clips = session?.clips || [];
+  if (!clips.length) return { index: 0, offset: 0 };
+  for (let i = 0; i < clips.length; i++) {
+    const c = clips[i];
+    const cEnd = Math.max(c.end_time || 0, c.start_time + Math.ceil(c.duration_sec || 1));
+    if (unix >= c.start_time && unix <= cEnd) {
+      return { index: i, offset: Math.max(0, unix - c.start_time) };
+    }
+  }
+  for (let i = 0; i < clips.length; i++) {
+    if (clips[i].start_time >= unix) {
+      return { index: i, offset: 0 };
+    }
+  }
+  return { index: clips.length - 1, offset: 0 };
+}
+
+function seekDayTimeline(targetUnix) {
+  const session = state.daySession;
+  if (!session || !session.clips.length) return;
+  const hit = findClipForUnix(session, targetUnix);
+  const video = qs('#modal-clip-video');
+  if (hit.index === session.index && video?.readyState >= 1) {
+    const maxT = Number.isFinite(video.duration) && video.duration > 0 ? Math.max(0, video.duration - 0.05) : hit.offset;
+    video.currentTime = Math.max(0, Math.min(maxT, hit.offset));
+    if (video.paused) {
+      video.play().catch(() => {});
+    }
+    updateDayPlayhead();
+  } else {
+    playDayClip(hit.index, hit.offset, true);
+  }
+}
+
+const clipVideoEl = qs('#modal-clip-video');
+clipVideoEl?.addEventListener('loadedmetadata', () => {
+  const session = state.daySession;
+  if (!session) return;
+  clipVideoEl.playbackRate = session.playbackRate || 1;
+  if (session.pendingSeek > 0) {
+    const maxT = Number.isFinite(clipVideoEl.duration) && clipVideoEl.duration > 0
+      ? Math.max(0, clipVideoEl.duration - 0.05)
+      : session.pendingSeek;
+    clipVideoEl.currentTime = Math.min(session.pendingSeek, maxT);
+    session.pendingSeek = 0;
+  }
+  if (session.pendingAutoplay) {
+    session.pendingAutoplay = false;
+    clipVideoEl.play().catch(() => {});
+  }
+  updateClipPlayButtons();
+  updateDayPlayhead();
+});
+
+clipVideoEl?.addEventListener('timeupdate', () => updateDayPlayhead());
+clipVideoEl?.addEventListener('play', updateClipPlayButtons);
+clipVideoEl?.addEventListener('pause', updateClipPlayButtons);
+clipVideoEl?.addEventListener('ended', () => {
+  const session = state.daySession;
+  if (session && session.index < session.clips.length - 1) {
+    playDayClip(session.index + 1, 0, true);
+  } else {
+    updateClipPlayButtons();
+  }
+});
+
+// Timeline track hover, scrub & desktop mouse-wheel zoom in 24h mode
+(() => {
+  const panel = qs('#day-timeline-panel');
+  const track = qs('#day-timeline-track');
+  const hover = qs('#day-timeline-hover');
+  if (!track) return;
+  let scrubbing = false;
+  const MIN_TL_SPAN = 60;
+
+  function clientXToInfo(clientX) {
+    const session = state.daySession;
+    const rect = track.getBoundingClientRect();
+    const ratio = rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : 0;
+    const { winStart, winEnd } = getTimelineWindow(session);
+    const unix = winStart + ratio * (winEnd - winStart);
+    return { ratio, unix };
+  }
+
+  function updateHover(clientX) {
+    const session = state.daySession;
+    if (!session || !hover) return;
+    const { ratio, unix } = clientXToInfo(clientX);
+    let label = formatClockTime(unix);
+    const hitIdx = session.clips.findIndex((c) => {
+      const cEnd = Math.max(c.end_time || 0, c.start_time + Math.ceil(c.duration_sec || 1));
+      return unix >= c.start_time && unix <= cEnd;
+    });
+    if (hitIdx >= 0) {
+      label += ` · Clip ${hitIdx + 1}`;
+    }
+    hover.textContent = label;
+    hover.style.left = `${Math.max(4, Math.min(96, ratio * 100))}%`;
+    hover.classList.remove('hidden');
+  }
+
+  track.addEventListener('pointerdown', (ev) => {
+    if (!state.daySession || ev.button > 0) return;
+    ev.preventDefault();
+    scrubbing = true;
+    try { track.setPointerCapture(ev.pointerId); } catch {}
+    const { unix } = clientXToInfo(ev.clientX);
+    updateHover(ev.clientX);
+    updateDayPlayhead(unix);
+  });
+
+  track.addEventListener('pointermove', (ev) => {
+    if (!state.daySession) return;
+    updateHover(ev.clientX);
+    if (scrubbing) {
+      const { unix } = clientXToInfo(ev.clientX);
+      updateDayPlayhead(unix);
+    }
+  });
+
+  function finishScrub(ev, cancelled) {
+    if (scrubbing) {
+      scrubbing = false;
+      try { track.releasePointerCapture(ev.pointerId); } catch {}
+      if (!cancelled) {
+        const { unix } = clientXToInfo(ev.clientX);
+        seekDayTimeline(unix);
+      }
+    }
+  }
+
+  track.addEventListener('pointerup', (ev) => finishScrub(ev, false));
+  track.addEventListener('pointercancel', (ev) => finishScrub(ev, true));
+  track.addEventListener('pointerleave', () => {
+    if (!scrubbing) hover?.classList.add('hidden');
+  });
+
+  (panel || track).addEventListener('wheel', (ev) => {
+    const session = state.daySession;
+    if (!session || session.tlMode !== '24h' || isMobileViewport()) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+
+    const rect = track.getBoundingClientRect();
+    const fullSpan = Math.max(1, session.day_end - session.day_start);
+    const winStart = session.tlViewStart ?? session.day_start;
+    const winEnd = session.tlViewEnd ?? session.day_end;
+    const curSpan = Math.max(MIN_TL_SPAN, Math.min(fullSpan, winEnd - winStart));
+
+    if (ev.shiftKey || Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) {
+      if (curSpan >= fullSpan - 1) return;
+      let delta = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+      if (ev.deltaMode === 1) delta *= 16;
+      else if (ev.deltaMode === 2) delta *= 200;
+      const panSec = (delta / Math.max(200, rect.width)) * curSpan * 0.8;
+      const nextStart = Math.max(session.day_start, Math.min(session.day_end - curSpan, winStart + panSec));
+      session.tlViewStart = nextStart;
+      session.tlViewEnd = nextStart + curSpan;
+    } else {
+      const ratio = rect.width > 0 ? Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width)) : 0.5;
+      const anchorUnix = winStart + ratio * curSpan;
+      let dy = ev.deltaY;
+      if (ev.deltaMode === 1) dy *= 16;
+      else if (ev.deltaMode === 2) dy *= 200;
+      const factor = Math.exp(dy * 0.0025);
+      const nextSpan = Math.max(MIN_TL_SPAN, Math.min(fullSpan, curSpan * factor));
+
+      if (dy > 0 && nextSpan > fullSpan * 0.96) {
+        session.tlViewStart = session.day_start;
+        session.tlViewEnd = session.day_end;
+      } else {
+        let nextStart = anchorUnix - ratio * nextSpan;
+        nextStart = Math.max(session.day_start, Math.min(session.day_end - nextSpan, nextStart));
+        session.tlViewStart = nextStart;
+        session.tlViewEnd = Math.min(session.day_end, nextStart + nextSpan);
+      }
+    }
+
+    renderDayTimeline();
+    updateHover(ev.clientX);
+  }, { passive: false });
+})();
+
+document.querySelectorAll('[data-tl-mode]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const session = state.daySession;
+    if (!session) return;
+    session.tlMode = btn.dataset.tlMode;
+    if (session.tlMode === '24h') {
+      session.tlViewStart = session.day_start;
+      session.tlViewEnd = session.day_end;
+    }
+    renderDayTimeline();
+  });
+});
+
+qs('#btn-tl-reset-zoom')?.addEventListener('click', () => {
+  const session = state.daySession;
+  if (!session) return;
+  session.tlViewStart = session.day_start;
+  session.tlViewEnd = session.day_end;
+  renderDayTimeline();
+});
+
+qs('#btn-clip-prev')?.addEventListener('click', () => {
+  if (state.daySession && state.daySession.index > 0) {
+    playDayClip(state.daySession.index - 1, 0, true);
+  }
+});
+
+qs('#btn-clip-next')?.addEventListener('click', () => {
+  if (state.daySession && state.daySession.index < state.daySession.clips.length - 1) {
+    playDayClip(state.daySession.index + 1, 0, true);
+  }
+});
+
+qs('#btn-clip-play')?.addEventListener('click', () => {
+  const video = qs('#modal-clip-video');
+  const session = state.daySession;
+  if (!video || !session) return;
+  if (video.ended && session.index >= session.clips.length - 1) {
+    playDayClip(0, 0, true);
+    return;
+  }
+  if (video.paused) {
+    video.play().catch(() => {});
+  } else {
+    video.pause();
+  }
+});
+
+qs('#clip-speed')?.addEventListener('change', (ev) => {
+  const rate = Number(ev.target.value) || 1;
+  if (state.daySession) state.daySession.playbackRate = rate;
+  if (clipVideoEl) clipVideoEl.playbackRate = rate;
+});
+
+qs('#btn-clip-mute')?.addEventListener('click', () => {
+  if (!clipVideoEl) return;
+  clipVideoEl.muted = !clipVideoEl.muted;
+  qs('#btn-clip-mute').textContent = clipVideoEl.muted ? 'Unmute' : 'Mute';
+});
+
+qs('#btn-clip-fs')?.addEventListener('click', () => {
+  toggleStreamFullscreen(qs('#clip-modal'));
+});
+
+function closeClipModal() {
+  exitStreamFullscreen(qs('#clip-modal'));
+  state.clipZoomCtrl?.reset();
+  const video = qs('#modal-clip-video');
+  if (video) {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  }
+  state.daySession = null;
+  qs('#clip-modal').classList.add('hidden');
+}
+
+qs('#btn-clip-delete').addEventListener('click', async () => {
+  const session = state.daySession;
+  if (!session || !session.clips.length) return;
+  const clip = session.clips[session.index];
+  if (!clip) return;
+  if (!confirm('Delete this recording clip permanently?')) return;
+  const res = await fetch(`/api/recordings/${clip.id}`, { method: 'DELETE' });
+  if (res.ok) {
+    session.clips.splice(session.index, 1);
+    if (!session.clips.length) {
+      closeClipModal();
+    } else {
+      const nextIdx = Math.min(session.index, session.clips.length - 1);
+      renderDayTimeline();
+      playDayClip(nextIdx, 0, true);
+    }
+    loadRecordings(false);
+    pollStatus();
+  }
+});
+
+// ONVIF Discovery
+qs('#btn-discover').addEventListener('click', async () => {
+  const btn = qs('#btn-discover');
+  const box = qs('#discover-results');
+  btn.disabled = true;
+  btn.textContent = 'Scanning...';
+  box.innerHTML = '<div class="muted small">Sending WS-Discovery multicast probe (3s)...</div>';
+  try {
+    const res = await fetch('/api/discover');
+    const data = await res.json();
+    const devs = data.devices || [];
+    if (!devs.length) {
+      box.innerHTML = '<div class="muted small">No ONVIF devices responded.</div>';
+    } else {
+      box.innerHTML = '';
+      for (const dev of devs) {
+        const el = document.createElement('div');
+        el.className = 'discover-item';
+        el.innerHTML = `
+          <div><strong>${escapeHTML(dev.name || 'ONVIF Camera')}</strong> <span class="muted">(${escapeHTML(dev.ip)})</span></div>
+          ${(dev.xaddrs || []).map((x) => `<code>${escapeHTML(x)}</code>`).join('')}
+        `;
+        box.appendChild(el);
+      }
+    }
+  } catch (err) {
+    box.innerHTML = `<div class="muted small">Discovery error: ${escapeHTML(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Scan LAN';
+  }
+});
+
+// Modal close listeners
+document.querySelectorAll('[data-close="live-modal"]').forEach((el) => {
+  el.addEventListener('click', closeLiveModal);
+});
+document.querySelectorAll('[data-close="clip-modal"]').forEach((el) => {
+  el.addEventListener('click', closeClipModal);
+});
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    if (isStreamFullscreen(qs('#live-modal'))) {
+      exitStreamFullscreen(qs('#live-modal'));
+      return;
+    }
+    if (isStreamFullscreen(qs('#clip-modal'))) {
+      exitStreamFullscreen(qs('#clip-modal'));
+      return;
+    }
+    if (state.activeModalCam) closeLiveModal();
+    if (state.daySession) closeClipModal();
+    return;
+  }
+  const tag = ev.target?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+  if (ev.key === '0') {
+    if (state.activeModalCam) state.liveZoomCtrl?.reset();
+    if (state.daySession) state.clipZoomCtrl?.reset();
+    return;
+  }
+
+  if (!state.daySession || !clipVideoEl) return;
+  if (ev.key === ' ' || ev.code === 'Space') {
+    if (tag === 'BUTTON' || tag === 'A') return;
+    ev.preventDefault();
+    if (clipVideoEl.ended && state.daySession.index >= state.daySession.clips.length - 1) {
+      playDayClip(0, 0, true);
+    } else if (clipVideoEl.paused) {
+      clipVideoEl.play().catch(() => {});
+    } else {
+      clipVideoEl.pause();
+    }
+  } else if (ev.key === 'ArrowLeft') {
+    ev.preventDefault();
+    const nextT = clipVideoEl.currentTime - 5;
+    if (nextT >= 0) {
+      clipVideoEl.currentTime = nextT;
+      updateDayPlayhead();
+    } else if (state.daySession.index > 0) {
+      const prevClip = state.daySession.clips[state.daySession.index - 1];
+      const prevDur = prevClip.duration_sec || 0;
+      playDayClip(state.daySession.index - 1, Math.max(0, prevDur + nextT), true);
+    } else {
+      clipVideoEl.currentTime = 0;
+      updateDayPlayhead();
+    }
+  } else if (ev.key === 'ArrowRight') {
+    ev.preventDefault();
+    const dur = Number.isFinite(clipVideoEl.duration) ? clipVideoEl.duration : (state.daySession.clips[state.daySession.index]?.duration_sec || 0);
+    const nextT = clipVideoEl.currentTime + 5;
+    if (nextT < dur) {
+      clipVideoEl.currentTime = nextT;
+      updateDayPlayhead();
+    } else if (state.daySession.index < state.daySession.clips.length - 1) {
+      playDayClip(state.daySession.index + 1, 0, true);
+    }
+  }
+});
+
+// Storage cap settings
+async function loadStorageSettings() {
+  try {
+    const res = await fetch('/api/settings/storage', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (typeof data.max_gb === 'number' && data.max_gb > 0) {
+      qs('#input-max-gb').value = String(data.max_gb);
+    }
+  } catch {}
+}
+
+qs('#btn-save-cap').addEventListener('click', async () => {
+  const input = qs('#input-max-gb');
+  const msg = qs('#cap-save-msg');
+  const btn = qs('#btn-save-cap');
+  const val = Number(input.value);
+  if (!Number.isFinite(val) || val <= 0) {
+    msg.textContent = 'Enter a valid GB value > 0';
+    return;
+  }
+  btn.disabled = true;
+  msg.textContent = 'Saving...';
+  try {
+    const res = await fetch('/api/settings/storage', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_gb: val }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msg.textContent = data.error || `Error ${res.status}`;
+      return;
+    }
+    msg.textContent = data.persisted ? 'Saved to config' : 'Saved (in memory)';
+    pollStatus();
+  } catch (err) {
+    msg.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// Start status polling
+loadLayoutSettings();
+loadStorageSettings();
+pollStatus();
+state.statusTimer = setInterval(pollStatus, 3000);

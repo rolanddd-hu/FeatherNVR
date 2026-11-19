@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1115">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>FeatherNVR</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot" id="server-dot"></span>
+      <span class="brand-name">FeatherNVR</span>
+      <span class="brand-meta" id="top-storage-pill">-- / -- GB</span>
+    </div>
+    <nav class="nav-links" id="nav-links" aria-label="Primary">
+      <button class="nav-btn active" data-tab="live">Live</button>
+      <button class="nav-btn" data-tab="recordings">Recordings</button>
+      <button class="nav-btn" data-tab="status">Status</button>
+    </nav>
+  </header>
+
+  <main class="main-content">
+    <!-- LIVE TAB -->
+    <section id="tab-live" class="tab-panel active">
+      <div class="toolbar">
+        <div class="toolbar-title">
+          <h2>Cameras</h2>
+          <span class="muted" id="live-summary">Loading...</span>
+        </div>
+        <div class="toolbar-controls">
+          <button id="btn-edit-layout" class="btn btn-secondary btn-sm">Edit Layout</button>
+          <button id="btn-reset-layout" class="btn btn-secondary btn-sm hidden">Reset Order</button>
+          <div class="col-selector" role="group" aria-label="Grid Columns">
+            <button class="chip active" data-cols="fit">Fit All</button>
+            <button class="chip" data-cols="auto">Auto</button>
+            <button class="chip" data-cols="1">1</button>
+            <button class="chip" data-cols="2">2</button>
+            <button class="chip" data-cols="3">3</button>
+            <button class="chip" data-cols="4">4</button>
+          </div>
+        </div>
+      </div>
+      <div id="camera-grid" class="camera-grid cols-fit"></div>
+    </section>
+
+    <!-- RECORDINGS TAB -->
+    <section id="tab-recordings" class="tab-panel">
+      <div class="toolbar wrap">
+        <div class="filters">
+          <select id="rec-camera" aria-label="Filter by camera">
+            <option value="">All Cameras</option>
+          </select>
+          <input type="date" id="rec-date" aria-label="Filter by date">
+          <button id="rec-clear-date" class="btn btn-secondary" title="Clear date">All Dates</button>
+          <button id="rec-refresh" class="btn btn-primary">Refresh</button>
+        </div>
+        <span class="muted" id="rec-count-label"></span>
+      </div>
+      <div id="recordings-list" class="recordings-grid"></div>
+      <div class="load-more-wrap">
+        <button id="rec-load-more" class="btn btn-secondary hidden">Load More</button>
+      </div>
+    </section>
+
+    <!-- STATUS TAB -->
+    <section id="tab-status" class="tab-panel">
+      <div class="cards-row">
+        <div class="card">
+          <h3>Storage Quota</h3>
+          <div class="progress-track">
+            <div class="progress-fill" id="status-storage-bar" style="width: 0%"></div>
+          </div>
+          <div class="kv-grid">
+            <div><span class="muted">Used / Cap</span><strong id="status-storage-used">--</strong></div>
+            <div><span class="muted">Clips</span><strong id="status-storage-clips">--</strong></div>
+            <div><span class="muted">Oldest Clip</span><strong id="status-storage-oldest">--</strong></div>
+            <div><span class="muted">Uptime</span><strong id="status-uptime">--</strong></div>
+          </div>
+          <div class="cap-editor">
+            <label for="input-max-gb" class="muted small">Storage Cap (GB)</label>
+            <div class="cap-row">
+              <input type="number" id="input-max-gb" min="0.1" max="1000000" step="0.5" placeholder="50">
+              <button id="btn-save-cap" class="btn btn-primary btn-sm">Save</button>
+              <span id="cap-save-msg" class="muted small"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>ONVIF LAN Discovery</h3>
+            <button id="btn-discover" class="btn btn-primary">Scan LAN</button>
+          </div>
+          <p class="muted small">Scans local network via UDP multicast (239.255.255.250:3702) for Hikvision &amp; Keview ONVIF endpoints.</p>
+          <div id="discover-results" class="discover-list"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Camera Diagnostics</h3>
+        <div class="table-wrap">
+          <table class="diag-table">
+            <thead>
+              <tr>
+                <th>Camera</th>
+                <th>Stream</th>
+                <th>Bitrate</th>
+                <th>FPS</th>
+                <th>Motion</th>
+                <th>Reconnects</th>
+                <th>Error</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="diag-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- LIVE MODAL -->
+  <div id="live-modal" class="modal modal-fullscreen hidden" role="dialog" aria-modal="true">
+    <div class="modal-backdrop" data-close="live-modal"></div>
+    <div class="modal-card modal-video-card">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="dot" id="modal-live-dot"></span>
+          <h3 id="modal-live-title">Camera</h3>
+          <span class="badge rec hidden" id="modal-live-rec">REC</span>
+        </div>
+        <button class="icon-btn" data-close="live-modal" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-player-wrap" id="modal-live-player-wrap">
+        <div class="zoom-stage" id="modal-live-zoom-stage"></div>
+        <button type="button" class="zoom-badge hidden" id="live-zoom-badge">1.0x &middot; Reset</button>
+      </div>
+      <div id="modal-ptz-panel" class="ptz-panel hidden">
+        <div class="ptz-controls">
+          <div class="ptz-dpad" role="group" aria-label="PTZ Direction">
+            <button type="button" class="ptz-btn" data-pan="-1" data-tilt="1" title="Up-Left">&#8598;</button>
+            <button type="button" class="ptz-btn" data-pan="0" data-tilt="1" title="Tilt Up">&#9650;</button>
+            <button type="button" class="ptz-btn" data-pan="1" data-tilt="1" title="Up-Right">&#8599;</button>
+            <button type="button" class="ptz-btn" data-pan="-1" data-tilt="0" title="Pan Left">&#9664;</button>
+            <button type="button" class="ptz-btn ptz-stop" id="btn-ptz-stop" title="Stop">&#9632;</button>
+            <button type="button" class="ptz-btn" data-pan="1" data-tilt="0" title="Pan Right">&#9654;</button>
+            <button type="button" class="ptz-btn" data-pan="-1" data-tilt="-1" title="Down-Left">&#8601;</button>
+            <button type="button" class="ptz-btn" data-pan="0" data-tilt="-1" title="Tilt Down">&#9660;</button>
+            <button type="button" class="ptz-btn" data-pan="1" data-tilt="-1" title="Down-Right">&#8600;</button>
+          </div>
+          <div class="ptz-side">
+            <div class="ptz-zoom-row">
+              <button type="button" class="ptz-btn ptz-zoom" data-zoom="-1" title="Zoom Out">Zoom -</button>
+              <button type="button" class="ptz-btn ptz-zoom" data-zoom="1" title="Zoom In">Zoom +</button>
+            </div>
+            <label class="ptz-speed-row">
+              <span>Speed <strong id="ptz-speed-val">60%</strong></span>
+              <input type="range" id="ptz-speed" min="0.2" max="1.0" step="0.1" value="0.6">
+            </label>
+          </div>
+        </div>
+        <div class="ptz-presets-wrap">
+          <span class="muted small">Presets:</span>
+          <div id="modal-ptz-presets" class="ptz-presets"></div>
+          <span class="muted small" id="ptz-status"></span>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <div class="btn-group">
+          <button id="btn-stream-sub" class="btn btn-secondary">Sub</button>
+          <button id="btn-stream-main" class="btn btn-secondary">Main</button>
+        </div>
+        <button id="btn-modal-ptz-toggle" class="btn btn-secondary hidden">PTZ</button>
+        <button id="btn-modal-mute" class="btn btn-secondary">Unmute</button>
+        <a id="btn-modal-snap" class="btn btn-secondary" href="#" target="_blank" rel="noopener">Snapshot</a>
+        <button id="btn-modal-fs" class="btn btn-secondary">Fullscreen</button>
+        <button id="btn-modal-rec" class="btn btn-danger">Record Now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CLIP PLAYBACK MODAL -->
+  <div id="clip-modal" class="modal modal-fullscreen hidden" role="dialog" aria-modal="true">
+    <div class="modal-backdrop" data-close="clip-modal"></div>
+    <div class="modal-card modal-video-card">
+      <div class="modal-header">
+        <div>
+          <h3 id="modal-clip-title">Day Playback</h3>
+          <div class="muted small" id="modal-clip-meta"></div>
+        </div>
+        <button class="icon-btn" data-close="clip-modal" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-player-wrap" id="modal-clip-player-wrap">
+        <div class="zoom-stage" id="modal-clip-zoom-stage">
+          <video id="modal-clip-video" playsinline autoplay></video>
+        </div>
+        <button type="button" class="zoom-badge hidden" id="clip-zoom-badge">1.0x &middot; Reset</button>
+        <div class="video-paused-pill hidden" id="clip-paused-pill">Paused</div>
+      </div>
+      <div id="day-timeline-panel" class="day-timeline-panel">
+        <div class="tl-header">
+          <div class="tl-header-left">
+            <strong id="tl-current-time">--:--:--</strong>
+            <span class="muted small" id="tl-clip-range"></span>
+          </div>
+          <div class="btn-group" role="group" aria-label="Timeline Range">
+            <button type="button" class="chip hidden" id="btn-tl-reset-zoom" title="Reset timeline zoom to 24h">Reset</button>
+            <button type="button" class="chip active" data-tl-mode="24h">24h</button>
+            <button type="button" class="chip" data-tl-mode="fit">Fit Clips</button>
+          </div>
+        </div>
+        <div id="day-timeline-track" class="tl-track">
+          <div id="day-timeline-segs" class="tl-segs"></div>
+          <div id="day-timeline-playhead" class="tl-playhead hidden"></div>
+          <div id="day-timeline-hover" class="tl-hover hidden"></div>
+        </div>
+        <div id="day-timeline-ticks" class="tl-ticks"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="btn-clip-prev" class="btn btn-secondary btn-sm" title="Previous clip">&#9664;&#9664;</button>
+        <button id="btn-clip-play" class="btn btn-primary btn-sm">Pause</button>
+        <button id="btn-clip-next" class="btn btn-secondary btn-sm" title="Next clip">&#9654;&#9654;</button>
+        <span id="clip-time-readout" class="muted small">0:00 / 0:00</span>
+        <select id="clip-speed" aria-label="Playback speed" class="speed-select">
+          <option value="1" selected>1x</option>
+          <option value="2">2x</option>
+          <option value="4">4x</option>
+          <option value="8">8x</option>
+        </select>
+        <button id="btn-clip-mute" class="btn btn-secondary btn-sm">Mute</button>
+        <button id="btn-clip-fs" class="btn btn-secondary btn-sm">Fullscreen</button>
+        <a id="btn-clip-download" class="btn btn-secondary btn-sm" href="#" download>Download</a>
+        <button id="btn-clip-delete" class="btn btn-danger btn-sm">Delete Clip</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,123 @@
+# FeatherNVR Configuration Example
+# Copy this file to config.yaml in the project root and edit with your camera details.
+# Tip: Run `.\feathernvr.exe -discover` to find ONVIF URLs for your Hikvision PTZ & Keview cameras.
+
+server:
+  listen: ":8080"
+  # Optional HTTP Basic Auth (recommended if exposing beyond trusted LAN):
+  # username: "admin"
+  # password: "change-me"
+
+go2rtc:
+  bin: "bin/go2rtc.exe"
+  api_port: 1984
+  rtsp_port: 8554
+  webrtc_port: 8555
+  config_path: "data/go2rtc.runtime.yaml"
+
+# Optional override; auto-detects ffmpeg on PATH or standard Windows install folders.
+# ffmpeg_bin: "C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe"
+
+storage:
+  dir: "recordings"
+  db_path: "data/feathernvr.db"
+  # Total disk cap in GB. When usage exceeds high_watermark_pct, oldest clips are deleted
+  # globally (FIFO) until usage drops below low_watermark_pct.
+  max_gb: 200
+  high_watermark_pct: 98
+  low_watermark_pct: 92
+  sweep_interval_sec: 300
+
+recording:
+  pre_record_sec: 5
+  post_record_sec: 10
+  max_clip_sec: 300
+  max_buffer_mb: 24
+
+# Hikvision DVR(s) for zero-CPU ISAPI motion events across analog HD channels.
+# Requires "Enable Hikvision-CGI" / ISAPI and VMD (Motion Detection) enabled on DVR channels.
+hikvision_dvrs:
+  - id: main_dvr
+    host: "192.168.1.50"
+    port: 80
+    username: "admin"
+    password: "dvr_password"
+    use_https: false
+
+cameras:
+  # ---------------------------------------------------------------------------
+  # 1) Hikvision DVR Analog HD Channels
+  # Channel numbering: 101=Ch1 Main, 102=Ch1 Sub, 201=Ch2 Main, 202=Ch2 Sub ...
+  # ---------------------------------------------------------------------------
+
+  # Option A (Recommended, ~0% CPU): Triggered by DVR's built-in VMD via ISAPI alertStream
+  - id: dvr_ch1_driveway
+    name: "Driveway (DVR Ch1)"
+    main_rtsp: "rtsp://admin:dvr_password@192.168.1.50:554/Streaming/Channels/101"
+    sub_rtsp: "rtsp://admin:dvr_password@192.168.1.50:554/Streaming/Channels/102"
+    motion:
+      mode: "hikvision_isapi"
+      dvr: "main_dvr"
+      channel: 1
+
+  # Option B (Fallback): Low-FPS sub-stream pixel diff (ignores timestamp OSD at top-left)
+  - id: dvr_ch2_garage
+    name: "Garage (DVR Ch2)"
+    main_rtsp: "rtsp://admin:dvr_password@192.168.1.50:554/Streaming/Channels/201"
+    sub_rtsp: "rtsp://admin:dvr_password@192.168.1.50:554/Streaming/Channels/202"
+    motion:
+      mode: "pixel"
+      fps: 2
+      width: 160
+      height: 90
+      threshold: 18
+      min_area_percent: 0.35
+      max_area_percent: 80.0
+      min_frames: 2
+      ignore_zones:
+        - [0.0, 0.0, 0.45, 0.12]
+
+  # ---------------------------------------------------------------------------
+  # 2) Hikvision ONVIF PTZ Camera (ISAPI PTZ + ONVIF/pixel motion fallback)
+  # ---------------------------------------------------------------------------
+  - id: ptz_front
+    name: "Front PTZ"
+    main_rtsp: "rtsp://admin:ptz_password@192.168.1.60:554/Streaming/Channels/101"
+    sub_rtsp: "rtsp://admin:ptz_password@192.168.1.60:554/Streaming/Channels/102"
+    motion:
+      mode: "onvif_or_pixel"
+      onvif_url: "http://192.168.1.60/onvif/device_service"
+      username: "admin"
+      password: "ptz_password"
+    ptz:
+      enabled: true
+      type: "hikvision_isapi"
+      url: "http://192.168.1.60:80"
+      username: "admin"
+      password: "ptz_password"
+      channel: 1
+
+  # ---------------------------------------------------------------------------
+  # 3) AliExpress Keview Generic ONVIF Cameras
+  # `onvif_or_pixel` tries ONVIF PullPoint events first and automatically falls
+  # back to lightweight 2-fps sub-stream pixel diff if the firmware lacks events.
+  # Common Keview ONVIF ports: 8899, 80, 8000, 8080 (run `-discover` to verify).
+  # ---------------------------------------------------------------------------
+  - id: keview_yard
+    name: "Back Yard (Keview)"
+    main_rtsp: "rtsp://admin:cam_password@192.168.1.71:554/stream1"
+    sub_rtsp: "rtsp://admin:cam_password@192.168.1.71:554/stream2"
+    motion:
+      mode: "onvif_or_pixel"
+      onvif_url: "http://192.168.1.71:8899/onvif/device_service"
+      username: "admin"
+      password: "cam_password"
+      ignore_zones:
+        - [0.0, 0.0, 0.40, 0.10]
+    ptz:
+      enabled: true
+      type: "onvif"
+      url: "http://192.168.1.71:8899/onvif/Ptz"
+      username: "admin"
+      password: "cam_password"
+      profile_token: "MainStreamToken"

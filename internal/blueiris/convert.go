@@ -1,0 +1,369 @@
+package blueiris
+
+import (
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"gopkg.in/yaml.v3"
+
+	"feathernvr/internal/config"
+)
+
+var hikChannelRe = regexp.MustCompile(`(?i)^/Streaming/Channels/(\d+)01(?:\b|/|\?|$)`)
+
+// Convert transforms parsed Blue Iris RawCamera items into a validated FeatherNVR Config.
+func Convert(raw []RawCamera, opts ImportOptions) (*ImportResult, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("no cameras found in Blue Iris source")
+	}
+	if opts.MaxGB <= 0 {
+		opts.MaxGB = 50
+	}
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{
+			MaxGB: opts.MaxGB,
+		},
+	}
+
+	res := &ImportResult{Config: cfg}
+	usedIDs := make(map[string]struct{}, len(raw))
+	dvrsByHost := make(map[string]string)
+
+	for _, rc := range raw {
+		enabled := rc.Enabled != 0
+		if !enabled && !opts.IncludeDisabled {
+			continue
+		}
+
+		id := uniqueSlug(rc.KeyName, rc.ShortName, usedIDs)
+		displayName := strings.TrimSpace(rc.KeyName)
+		if displayName == "" {
+			displayName = id
+		}
+
+		pass := decodeBlueIrisPassword(rc.PasswordRaw, rc.PasswordEncoded)
+		host := strings.TrimSpace(rc.IP)
+		rtspPort := rc.RTSPPort
+		if rtspPort <= 0 {
+			rtspPort = 554
+		}
+		onvifPort := effectiveONVIFPort(rc, rtspPort)
+
+		cam := config.CameraConfig{
+			ID:      id,
+			Name:    displayName,
+			Enabled: boolPtr(enabled),
+		}
+
+		if !enabled {
+			res.DisabledCount++
+			if host != "" {
+				cam.MainRTSP = buildStreamURL(host, rtspPort, rc.Username, pass, rc.Path, rc.Params, rc.CamNo)
+				if strings.TrimSpace(rc.SubPath) != "" {
+					cam.SubRTSP = buildStreamURL(host, rtspPort, rc.Username, pass, rc.SubPath, rc.Params, rc.CamNo)
+				}
+			}
+			cam.Motion = config.MotionConfig{Mode: config.MotionModeNone}
+			cfg.Cameras = append(cfg.Cameras, cam)
+			continue
+		}
+
+		if host == "" {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("camera %q has empty IP; skipped", displayName))
+			continue
+		}
+
+		res.EnabledCount++
+		cam.MainRTSP = buildStreamURL(host, rtspPort, rc.Username, pass, rc.Path, rc.Params, rc.CamNo)
+		if strings.TrimSpace(rc.SubPath) != "" {
+			cam.SubRTSP = buildStreamURL(host, rtspPort, rc.Username, pass, rc.SubPath, rc.Params, rc.CamNo)
+		}
+
+		normMainPath := normalizeStreamPath(host, rc.Path, rc.CamNo)
+		if m := hikChannelRe.FindStringSubmatch(normMainPath); len(m) == 2 {
+			chNum, _ := strconv.Atoi(m[1])
+			if chNum > 0 {
+				dvrID, exists := dvrsByHost[host]
+				if !exists {
+					dvrID = fmt.Sprintf("hikvision_dvr_%d", len(cfg.HikvisionDVRs)+1)
+					dvrPort := rc.Port
+					if dvrPort <= 0 {
+						if rc.HTTPS == 1 {
+							dvrPort = 443
+						} else {
+							dvrPort = 80
+						}
+					}
+					cfg.HikvisionDVRs = append(cfg.HikvisionDVRs, config.HikvisionDVRConfig{
+						ID:       dvrID,
+						Host:     host,
+						Port:     dvrPort,
+						Username: rc.Username,
+						Password: pass,
+						UseHTTPS: rc.HTTPS == 1 && dvrPort != 80,
+					})
+					dvrsByHost[host] = dvrID
+				}
+				if cam.SubRTSP == "" {
+					subPath := fmt.Sprintf("/Streaming/Channels/%d02", chNum)
+					cam.SubRTSP = buildRTSPURL(host, rtspPort, rc.Username, pass, subPath, rc.Params)
+				}
+				cam.Motion = config.MotionConfig{
+					Mode:        config.MotionModeISAPIOrPixel,
+					DVR:         dvrID,
+					Channel:     chNum,
+					IgnoreZones: [][4]float64{{0.0, 0.0, 0.45, 0.12}},
+				}
+				cfg.Cameras = append(cfg.Cameras, cam)
+				continue
+			}
+		}
+
+		scheme := "http"
+		if rc.HTTPS == 1 {
+			scheme = "https"
+		}
+		cam.Motion = config.MotionConfig{
+			Mode:     config.MotionModeONVIFOrPixel,
+			ONVIFURL: fmt.Sprintf("%s://%s/onvif/device_service", scheme, net.JoinHostPort(host, strconv.Itoa(onvifPort))),
+			Username: rc.Username,
+			Password: pass,
+		}
+		if rc.PTZEnabled == 1 {
+			cam.PTZ = buildPTZConfig(rc, host, scheme, onvifPort, pass)
+		}
+		cfg.Cameras = append(cfg.Cameras, cam)
+	}
+
+	res.DVRCount = len(cfg.HikvisionDVRs)
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate imported config: %w", err)
+	}
+	return res, nil
+}
+
+// WriteConfigYAML writes the imported Config to outPath, backing up any existing file when force is true.
+func WriteConfigYAML(outPath string, cfg *config.Config, force bool) error {
+	if _, err := os.Stat(outPath); err == nil {
+		if !force {
+			return fmt.Errorf("%q already exists (pass -force to overwrite and back up the previous file)", outPath)
+		}
+		backupPath := outPath + ".bak"
+		if prev, readErr := os.ReadFile(outPath); readErr == nil {
+			_ = os.WriteFile(backupPath, prev, 0o600)
+		}
+	}
+
+	dir := filepath.Dir(outPath)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create config directory: %w", err)
+		}
+	}
+
+	yamlBytes, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal imported config: %w", err)
+	}
+
+	header := "# Generated by FeatherNVR Blue Iris importer.\n# Storage cap can also be changed anytime from the Web UI Status tab.\n\n"
+	if err := os.WriteFile(outPath, append([]byte(header), yamlBytes...), 0o600); err != nil {
+		return fmt.Errorf("write config %q: %w", outPath, err)
+	}
+	return nil
+}
+
+func decodeBlueIrisPassword(raw string, encoded int) string {
+	if raw == "" || encoded != 1 {
+		return raw
+	}
+	if b, err := base64.StdEncoding.DecodeString(raw); err == nil {
+		return string(b)
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(raw); err == nil {
+		return string(b)
+	}
+	return raw
+}
+
+func buildPTZConfig(rc RawCamera, host, scheme string, onvifPort int, pass string) config.PTZConfig {
+	if rc.PTZProtocol == 324 {
+		httpPort := rc.Port
+		if httpPort <= 0 {
+			if rc.HTTPS == 1 {
+				httpPort = 443
+			} else {
+				httpPort = 80
+			}
+		}
+		return config.PTZConfig{
+			Enabled:  true,
+			Type:     "hikvision_isapi",
+			URL:      fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(host, strconv.Itoa(httpPort))),
+			Username: rc.Username,
+			Password: pass,
+			Channel:  1,
+		}
+	}
+
+	ptzPath := strings.TrimSpace(rc.PTZPage)
+	if ptzPath == "" {
+		ptzPath = "/onvif/device_service"
+	} else if !strings.HasPrefix(ptzPath, "/") {
+		ptzPath = "/" + ptzPath
+	}
+	return config.PTZConfig{
+		Enabled:      true,
+		Type:         "onvif",
+		URL:          fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(host, strconv.Itoa(onvifPort)), ptzPath),
+		Username:     rc.Username,
+		Password:     pass,
+		ProfileToken: strings.TrimSpace(rc.ProfileToken),
+	}
+}
+
+func effectiveONVIFPort(rc RawCamera, rtspPort int) int {
+	if rc.ONVIFPort > 0 && rc.ONVIFPort != rtspPort {
+		if rc.ONVIFPort == 8999 && rc.Port > 0 && rc.Port != 8999 {
+			return rc.Port
+		}
+		return rc.ONVIFPort
+	}
+	if rc.Port > 0 {
+		return rc.Port
+	}
+	return 80
+}
+
+func buildStreamURL(host string, rtspPort int, user, pass, rawPath, params string, camNo int) string {
+	trimmed := strings.TrimSpace(rawPath)
+	if strings.HasPrefix(strings.ToLower(trimmed), "rtsp://") {
+		return injectURLCredentials(trimmed, user, pass)
+	}
+	normPath := normalizeStreamPath(host, trimmed, camNo)
+	return buildRTSPURL(host, rtspPort, user, pass, normPath, params)
+}
+
+func normalizeStreamPath(host, rawPath string, camNo int) string {
+	p := strings.TrimSpace(rawPath)
+	if camNo <= 0 {
+		camNo = 1
+	}
+	p = strings.ReplaceAll(p, "{CAMNO}", strconv.Itoa(camNo))
+
+	// Handle Blue Iris paths saved with an IP prefix such as "198.51.100.10/Streaming/Channels/102".
+	if host != "" && strings.HasPrefix(p, host+"/") {
+		p = strings.TrimPrefix(p, host)
+	}
+	if p == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
+
+func buildRTSPURL(host string, port int, user, pass, path, params string) string {
+	u := &url.URL{
+		Scheme: "rtsp",
+		Host:   net.JoinHostPort(host, strconv.Itoa(port)),
+	}
+	if user != "" || pass != "" {
+		u.User = url.UserPassword(user, pass)
+	}
+	p := path
+	var rawQuery string
+	if idx := strings.IndexByte(p, '?'); idx >= 0 {
+		rawQuery = p[idx+1:]
+		p = p[:idx]
+	}
+	u.Path = p
+	params = strings.TrimPrefix(strings.TrimSpace(params), "?")
+	if params != "" {
+		if rawQuery != "" {
+			rawQuery += "&" + params
+		} else {
+			rawQuery = params
+		}
+	}
+	u.RawQuery = rawQuery
+	return u.String()
+}
+
+func injectURLCredentials(rawURL, user, pass string) string {
+	if user == "" && pass == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	if u.User == nil {
+		u.User = url.UserPassword(user, pass)
+	}
+	return u.String()
+}
+
+var latinReplacer = strings.NewReplacer(
+	"á", "a", "à", "a", "ä", "a", "â", "a", "ã", "a", "å", "a",
+	"é", "e", "è", "e", "ë", "e", "ê", "e",
+	"í", "i", "ì", "i", "ï", "i", "î", "i",
+	"ó", "o", "ò", "o", "ö", "o", "ő", "o", "ô", "o", "õ", "o", "ø", "o",
+	"ú", "u", "ù", "u", "ü", "u", "ű", "u", "û", "u",
+	"ñ", "n", "ç", "c", "ß", "ss", "ý", "y", "ÿ", "y",
+)
+
+func uniqueSlug(primary, fallback string, used map[string]struct{}) string {
+	base := slugify(primary)
+	if base == "" {
+		base = slugify(fallback)
+	}
+	if base == "" {
+		base = "camera"
+	}
+	candidate := base
+	for i := 2; ; i++ {
+		if _, exists := used[candidate]; !exists {
+			used[candidate] = struct{}{}
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s_%d", base, i)
+	}
+}
+
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = latinReplacer.Replace(s)
+	var b strings.Builder
+	prevUnderscore := true
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevUnderscore = false
+			continue
+		}
+		if r == '-' || r == '_' || unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			if !prevUnderscore {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+func boolPtr(v bool) *bool {
+	return &v
+}
