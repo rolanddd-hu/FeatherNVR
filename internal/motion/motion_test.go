@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -288,5 +289,83 @@ func TestISAPIHubStopsOn401WhenOnlyFallbackChannels(t *testing.T) {
 	case <-hubDone:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected ISAPIHub.Run to exit cleanly after HTTP 401 when only fallback channels exist")
+	}
+}
+
+func TestProbeCameraONVIF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ISAPI/PTZCtrl/channels/1/capabilities" {
+			http.NotFound(w, r)
+			return
+		}
+		bodyBytes, _ := io.ReadAll(r.Body)
+		body := string(bodyBytes)
+		w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
+
+		switch {
+		case strings.Contains(body, "GetSystemDateAndTime"):
+			_, _ = io.WriteString(w, `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime><Time><Hour>12</Hour><Minute>0</Minute><Second>0</Second></Time><Date><Year>2026</Year><Month>11</Month><Day>20</Day></Date></UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse></s:Body></s:Envelope>`)
+		case strings.Contains(body, "GetCapabilities"):
+			_, _ = io.WriteString(w, fmt.Sprintf(`<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema">
+  <s:Body><GetCapabilitiesResponse><Capabilities>
+    <tt:Events><tt:XAddr>http://127.0.0.1/onvif/events</tt:XAddr><tt:WSPullPointSupport>false</tt:WSPullPointSupport></tt:Events>
+    <tt:Media><tt:XAddr>http://%s/onvif/media</tt:XAddr></tt:Media>
+    <tt:PTZ><tt:XAddr>http://%s/onvif/ptz</tt:XAddr></tt:PTZ>
+  </Capabilities></GetCapabilitiesResponse></s:Body>
+</s:Envelope>`, r.Host, r.Host))
+		case strings.Contains(body, "GetDeviceInformation"):
+			_, _ = io.WriteString(w, `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><GetDeviceInformationResponse><Manufacturer>AcmeCam</Manufacturer><Model>ProDome</Model></GetDeviceInformationResponse></s:Body></s:Envelope>`)
+		case strings.Contains(body, "GetProfiles"):
+			_, _ = io.WriteString(w, `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+  <s:Body><trt:GetProfilesResponse>
+    <trt:Profiles token="SubToken">
+      <tt:Name>SubStream</tt:Name>
+      <tt:VideoEncoderConfiguration>
+        <tt:Encoding>H264</tt:Encoding>
+        <tt:Resolution><tt:Width>640</tt:Width><tt:Height>480</tt:Height></tt:Resolution>
+        <tt:RateControl><tt:FrameRateLimit>15</tt:FrameRateLimit></tt:RateControl>
+      </tt:VideoEncoderConfiguration>
+    </trt:Profiles>
+    <trt:Profiles token="MainToken">
+      <tt:Name>MainStream</tt:Name>
+      <tt:VideoEncoderConfiguration>
+        <tt:Encoding>H265</tt:Encoding>
+        <tt:Resolution><tt:Width>2560</tt:Width><tt:Height>1440</tt:Height></tt:Resolution>
+        <tt:RateControl><tt:FrameRateLimit>20</tt:FrameRateLimit></tt:RateControl>
+      </tt:VideoEncoderConfiguration>
+    </trt:Profiles>
+  </trt:GetProfilesResponse></s:Body>
+</s:Envelope>`)
+		case strings.Contains(body, "GetStreamUri"):
+			if strings.Contains(body, "<trt:ProfileToken>MainToken</trt:ProfileToken>") {
+				_, _ = io.WriteString(w, `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><GetStreamUriResponse><MediaUri><tt:Uri>rtsp://admin:secret@192.0.2.50:554/stream1</tt:Uri></MediaUri></GetStreamUriResponse></s:Body></s:Envelope>`)
+			} else {
+				_, _ = io.WriteString(w, `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><GetStreamUriResponse><MediaUri><tt:Uri>rtsp://192.0.2.50:554/stream2</tt:Uri></MediaUri></GetStreamUriResponse></s:Body></s:Envelope>`)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	port, _ := strconv.Atoi(u.Port())
+	res, err := ProbeCamera(context.Background(), ProbeRequest{
+		Host:     u.Hostname(),
+		Port:     port,
+		Username: "admin",
+		Password: "secret",
+	})
+	if err != nil {
+		t.Fatalf("ProbeCamera failed: %v", err)
+	}
+	if res.Name != "AcmeCam ProDome" || res.SuggestedMotionMode != config.MotionModePixel {
+		t.Fatalf("unexpected probe metadata: %+v", res)
+	}
+	if res.MainRTSP != "rtsp://192.0.2.50:554/stream1" || res.SubRTSP != "rtsp://192.0.2.50:554/stream2" {
+		t.Fatalf("expected credential-free MainRTSP/SubRTSP, got main=%q sub=%q", res.MainRTSP, res.SubRTSP)
+	}
+	if !res.PTZEnabled || res.PTZType != "onvif" || res.PTZProfileToken != "MainToken" || !strings.HasSuffix(res.PTZURL, "/onvif/ptz") {
+		t.Fatalf("unexpected PTZ probe result: %+v", res)
 	}
 }

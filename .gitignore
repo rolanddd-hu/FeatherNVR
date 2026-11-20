@@ -1,7 +1,9 @@
 # Local toolchains & downloaded/built binaries
 .tools/
+dist/
 bin/*
 !bin/.gitkeep
+/feathernvr
 *.exe
 *.exe~
 *~

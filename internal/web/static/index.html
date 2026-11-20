@@ -33,9 +33,10 @@
           <span class="muted" id="live-summary">Loading...</span>
         </div>
         <div class="toolbar-controls">
+          <button id="btn-add-camera" class="btn btn-primary btn-sm">+ Add Camera</button>
           <button id="btn-edit-layout" class="btn btn-secondary btn-sm">Edit Layout</button>
           <button id="btn-reset-layout" class="btn btn-secondary btn-sm hidden">Reset Order</button>
-          <div class="col-selector" role="group" aria-label="Grid Columns">
+          <div class="col-selector" id="live-col-selector" role="group" aria-label="Grid Columns">
             <button class="chip active" data-cols="fit">Fit All</button>
             <button class="chip" data-cols="auto">Auto</button>
             <button class="chip" data-cols="1">1</button>
@@ -59,10 +60,20 @@
           <button id="rec-clear-date" class="btn btn-secondary" title="Clear date">All Dates</button>
           <button id="rec-refresh" class="btn btn-primary">Refresh</button>
         </div>
-        <span class="muted" id="rec-count-label"></span>
+        <div class="toolbar-controls">
+          <span class="muted" id="rec-count-label"></span>
+          <div class="col-selector" id="rec-col-selector" role="group" aria-label="Recordings Grid Columns">
+            <button class="chip" data-cols="fit">Fit All</button>
+            <button class="chip active" data-cols="auto">Auto</button>
+            <button class="chip" data-cols="1">1</button>
+            <button class="chip" data-cols="2">2</button>
+            <button class="chip" data-cols="3">3</button>
+            <button class="chip" data-cols="4">4</button>
+          </div>
+        </div>
       </div>
-      <div id="recordings-list" class="recordings-grid"></div>
-      <div class="load-more-wrap">
+      <div id="recordings-list" class="recordings-grid cols-auto"></div>
+      <div class="load-more-wrap hidden" id="rec-load-more-wrap">
         <button id="rec-load-more" class="btn btn-secondary hidden">Load More</button>
       </div>
     </section>
@@ -179,6 +190,7 @@
         <button id="btn-modal-mute" class="btn btn-secondary">Unmute</button>
         <a id="btn-modal-snap" class="btn btn-secondary" href="#" target="_blank" rel="noopener">Snapshot</a>
         <button id="btn-modal-fs" class="btn btn-secondary">Fullscreen</button>
+        <button id="btn-modal-settings" class="btn btn-secondary">Settings</button>
         <button id="btn-modal-rec" class="btn btn-danger">Record Now</button>
       </div>
     </div>
@@ -197,7 +209,8 @@
       </div>
       <div class="modal-player-wrap" id="modal-clip-player-wrap">
         <div class="zoom-stage" id="modal-clip-zoom-stage">
-          <video id="modal-clip-video" playsinline autoplay></video>
+          <video id="modal-clip-video" class="clip-deck-video active" playsinline preload="auto"></video>
+          <video id="modal-clip-video-next" class="clip-deck-video standby" playsinline muted preload="auto"></video>
         </div>
         <button type="button" class="zoom-badge hidden" id="clip-zoom-badge">1.0x &middot; Reset</button>
         <div class="video-paused-pill hidden" id="clip-paused-pill">Paused</div>
@@ -223,10 +236,14 @@
       </div>
       <div class="modal-actions">
         <button id="btn-clip-prev" class="btn btn-secondary btn-sm" title="Previous clip">&#9664;&#9664;</button>
+        <button id="btn-clip-prev-frame" class="btn btn-secondary btn-sm" title="Previous frame (,)">&#9664;&#10074;</button>
         <button id="btn-clip-play" class="btn btn-primary btn-sm">Pause</button>
+        <button id="btn-clip-next-frame" class="btn btn-secondary btn-sm" title="Next frame (.)">&#10074;&#9654;</button>
         <button id="btn-clip-next" class="btn btn-secondary btn-sm" title="Next clip">&#9654;&#9654;</button>
         <span id="clip-time-readout" class="muted small">0:00 / 0:00</span>
         <select id="clip-speed" aria-label="Playback speed" class="speed-select">
+          <option value="0.25">0.25x (1/4)</option>
+          <option value="0.5">0.5x (1/2)</option>
           <option value="1" selected>1x</option>
           <option value="2">2x</option>
           <option value="4">4x</option>
@@ -237,6 +254,278 @@
         <a id="btn-clip-download" class="btn btn-secondary btn-sm" href="#" download>Download</a>
         <button id="btn-clip-delete" class="btn btn-danger btn-sm">Delete Clip</button>
       </div>
+    </div>
+  </div>
+
+  <!-- RIGHT-CLICK CONTEXT MENU -->
+  <div id="cam-context-menu" class="context-menu hidden" role="menu">
+    <div class="context-menu-header" id="ctx-cam-name">Camera</div>
+    <button type="button" class="context-menu-item" data-ctx-action="settings" role="menuitem">Camera Settings...</button>
+    <button type="button" class="context-menu-item" data-ctx-action="open" role="menuitem">Open Large View</button>
+    <button type="button" class="context-menu-item" id="ctx-toggle-stream" data-ctx-action="toggle-stream" role="menuitem">Switch Live Stream</button>
+    <button type="button" class="context-menu-item" data-ctx-action="record" role="menuitem">Record Now</button>
+    <div class="context-menu-sep" role="separator"></div>
+    <button type="button" class="context-menu-item danger" data-ctx-action="delete" role="menuitem">Delete Camera...</button>
+  </div>
+
+  <!-- ADD / EDIT CAMERA DIALOG -->
+  <div id="camera-dialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="cam-dlg-title">
+    <div class="modal-backdrop" data-close="camera-dialog"></div>
+    <div class="modal-card modal-form-card">
+      <div class="modal-header">
+        <div>
+          <h3 id="cam-dlg-title">Add Camera</h3>
+          <div class="muted small" id="cam-dlg-subtitle">Auto-detect ONVIF streams, test connectivity, and configure live view &amp; motion.</div>
+        </div>
+        <button type="button" class="icon-btn" data-close="camera-dialog" aria-label="Close">&times;</button>
+      </div>
+      <form id="cam-dlg-form" class="modal-form">
+        <div class="modal-form-body">
+          <div class="form-section">
+            <div class="form-section-head">
+              <h4>Discovery &amp; Auto-Detect</h4>
+              <div class="inline-actions">
+                <button type="button" id="btn-cam-scan-lan" class="btn btn-secondary btn-sm">Scan LAN</button>
+                <span class="muted small" id="cam-scan-status"></span>
+              </div>
+            </div>
+            <div id="cam-scan-results" class="scan-chips hidden"></div>
+            <div class="form-grid">
+              <label class="form-field">
+                <span>Camera Host / IP / ONVIF URL</span>
+                <input type="text" id="cam-probe-host" placeholder="192.168.1.50 or http://.../onvif/device_service" autocomplete="off">
+              </label>
+              <label class="form-field">
+                <span>ONVIF / HTTP Port</span>
+                <input type="number" id="cam-probe-port" min="1" max="65535" value="80">
+              </label>
+              <label class="form-field">
+                <span>Camera Username</span>
+                <input type="text" id="cam-user" placeholder="admin" autocomplete="off">
+              </label>
+              <label class="form-field">
+                <span>Camera Password</span>
+                <input type="password" id="cam-pass" placeholder="Enter password" autocomplete="new-password">
+              </label>
+            </div>
+            <div class="inline-actions">
+              <button type="button" id="btn-cam-autodetect" class="btn btn-secondary btn-sm">Auto-Detect</button>
+              <span class="muted small" id="cam-probe-status"></span>
+            </div>
+            <div id="cam-probe-profiles" class="probe-profiles hidden"></div>
+          </div>
+
+          <div class="form-section">
+            <h4>General &amp; Streams</h4>
+            <div class="form-grid">
+              <label class="form-field">
+                <span>Camera Name</span>
+                <input type="text" id="cam-name" required placeholder="Front Gate">
+              </label>
+              <label class="form-field">
+                <span>Camera ID</span>
+                <input type="text" id="cam-id" placeholder="front_gate" pattern="[a-zA-Z0-9_-]*">
+              </label>
+              <label class="form-field form-check full">
+                <input type="checkbox" id="cam-enabled" checked>
+                <span>Enabled (connect streams and monitor motion)</span>
+              </label>
+              <div class="form-field full">
+                <span>Main RTSP URL (Recording + Optional Main Live)</span>
+                <div class="input-row">
+                  <input type="text" id="cam-main-rtsp" required placeholder="rtsp://192.168.1.50:554/Streaming/Channels/101" autocomplete="off">
+                  <button type="button" id="btn-cam-test-main" class="btn btn-secondary btn-sm">Test</button>
+                </div>
+              </div>
+              <div class="form-field full">
+                <span>Sub RTSP URL (Live Grid / Low Bandwidth)</span>
+                <div class="input-row">
+                  <input type="text" id="cam-sub-rtsp" placeholder="rtsp://192.168.1.50:554/Streaming/Channels/102" autocomplete="off">
+                  <button type="button" id="btn-cam-test-sub" class="btn btn-secondary btn-sm">Test</button>
+                </div>
+              </div>
+            </div>
+            <div id="cam-test-preview" class="test-preview-box hidden">
+              <img id="cam-test-img" class="hidden" alt="Stream test snapshot">
+              <div class="test-preview-info">
+                <div id="cam-test-meta" class="small"></div>
+                <div id="cam-test-msg" class="muted small"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <h4>Display &amp; Live View</h4>
+            <div class="form-grid">
+              <label class="form-field">
+                <span>Live Grid Stream</span>
+                <select id="cam-live-stream">
+                  <option value="sub">Sub Stream (Fast Grid)</option>
+                  <option value="main">Main Stream (High Resolution)</option>
+                </select>
+              </label>
+              <label class="form-field">
+                <span>Resolution Label</span>
+                <input type="text" id="cam-resolution" list="cam-res-list" placeholder="e.g. 1920x1080">
+                <datalist id="cam-res-list">
+                  <option value="3840x2160">
+                  <option value="2560x1440">
+                  <option value="1920x1080">
+                  <option value="1280x720">
+                  <option value="640x480">
+                  <option value="640x360">
+                </datalist>
+              </label>
+              <label class="form-field">
+                <span>Tile Aspect Ratio</span>
+                <select id="cam-aspect-ratio">
+                  <option value="">Auto (16:9 contain)</option>
+                  <option value="16:9">16:9</option>
+                  <option value="4:3">4:3</option>
+                  <option value="fill">Fill Tile (Cover)</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <h4>Motion Detection</h4>
+            <div class="form-grid">
+              <label class="form-field full">
+                <span>Motion Mode</span>
+                <select id="cam-motion-mode">
+                  <option value="pixel">Pixel Diff (FFmpeg)</option>
+                  <option value="onvif">ONVIF PullPoint</option>
+                  <option value="onvif_or_pixel">ONVIF + Pixel Diff</option>
+                  <option value="hikvision_isapi">Hikvision DVR ISAPI</option>
+                  <option value="isapi_or_pixel">ISAPI + Pixel Diff</option>
+                  <option value="none">None (Manual Only)</option>
+                </select>
+              </label>
+            </div>
+            <div id="cam-motion-onvif-group" class="form-grid hidden">
+              <label class="form-field full">
+                <span>ONVIF Service URL</span>
+                <input type="text" id="cam-motion-onvif-url" placeholder="http://192.168.1.50/onvif/device_service" autocomplete="off">
+              </label>
+              <label class="form-field">
+                <span>ONVIF Username</span>
+                <input type="text" id="cam-motion-user" placeholder="Defaults to camera username" autocomplete="off">
+              </label>
+              <label class="form-field">
+                <span>ONVIF Password</span>
+                <input type="password" id="cam-motion-pass" placeholder="Leave blank to keep/share" autocomplete="new-password">
+              </label>
+            </div>
+            <div id="cam-motion-dvr-group" class="form-grid hidden">
+              <label class="form-field">
+                <span>Hikvision DVR</span>
+                <select id="cam-motion-dvr"></select>
+              </label>
+              <label class="form-field">
+                <span>DVR Channel</span>
+                <input type="number" id="cam-motion-channel" min="1" placeholder="1">
+              </label>
+            </div>
+            <div id="cam-motion-pixel-group" class="form-grid">
+              <label class="form-field">
+                <span>Sample FPS</span>
+                <input type="number" id="cam-motion-fps" min="1" max="30" value="3">
+              </label>
+              <label class="form-field">
+                <span>Analysis Width (px)</span>
+                <input type="number" id="cam-motion-width" min="32" max="1280" value="320">
+              </label>
+              <label class="form-field">
+                <span>Analysis Height (px)</span>
+                <input type="number" id="cam-motion-height" min="32" max="720" value="180">
+              </label>
+              <label class="form-field">
+                <span>Pixel Threshold (1-255)</span>
+                <input type="number" id="cam-motion-threshold" min="1" max="255" value="25">
+              </label>
+              <label class="form-field">
+                <span>Min Changed Area (%)</span>
+                <input type="number" id="cam-motion-min-area" step="0.1" min="0.01" max="100" value="1.2">
+              </label>
+              <label class="form-field">
+                <span>Max Changed Area (%)</span>
+                <input type="number" id="cam-motion-max-area" step="1" min="1" max="100" value="85">
+              </label>
+              <label class="form-field">
+                <span>Min Consecutive Frames</span>
+                <input type="number" id="cam-motion-min-frames" min="1" max="60" value="2">
+              </label>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <h4>Recording Overrides <span class="muted small">(blank = global default)</span></h4>
+            <div class="form-grid">
+              <label class="form-field">
+                <span>Pre-Record (sec)</span>
+                <input type="number" id="cam-pre-rec" min="0" placeholder="Global default">
+              </label>
+              <label class="form-field">
+                <span>Post-Record (sec)</span>
+                <input type="number" id="cam-post-rec" min="0" placeholder="Global default">
+              </label>
+              <label class="form-field">
+                <span>Max Clip (sec)</span>
+                <input type="number" id="cam-max-clip" min="1" placeholder="Global default">
+              </label>
+            </div>
+          </div>
+
+          <div class="form-section">
+            <h4>PTZ Control</h4>
+            <label class="form-field form-check">
+              <input type="checkbox" id="cam-ptz-enabled">
+              <span>Enable PTZ control for this camera</span>
+            </label>
+            <div id="cam-ptz-group" class="form-grid hidden">
+              <label class="form-field">
+                <span>PTZ Protocol</span>
+                <select id="cam-ptz-type">
+                  <option value="onvif">ONVIF PTZ</option>
+                  <option value="hikvision_isapi">Hikvision ISAPI PTZ</option>
+                </select>
+              </label>
+              <label class="form-field">
+                <span>PTZ Service URL</span>
+                <input type="text" id="cam-ptz-url" placeholder="http://192.168.1.50/onvif/ptz_service" autocomplete="off">
+              </label>
+              <label class="form-field">
+                <span>PTZ Username</span>
+                <input type="text" id="cam-ptz-user" placeholder="Defaults to camera username" autocomplete="off">
+              </label>
+              <label class="form-field">
+                <span>PTZ Password</span>
+                <input type="password" id="cam-ptz-pass" placeholder="Leave blank to keep/share" autocomplete="new-password">
+              </label>
+              <label class="form-field ptz-onvif-field">
+                <span>ONVIF Profile Token</span>
+                <input type="text" id="cam-ptz-token" placeholder="Profile_1">
+              </label>
+              <label class="form-field ptz-isapi-field hidden">
+                <span>ISAPI Channel</span>
+                <input type="number" id="cam-ptz-channel" min="1" placeholder="1">
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-form-footer">
+          <div class="inline-actions">
+            <button type="button" id="btn-cam-delete" class="btn btn-danger btn-sm hidden">Delete Camera</button>
+            <span id="cam-dlg-error" class="form-error"></span>
+          </div>
+          <div class="inline-actions">
+            <button type="button" class="btn btn-secondary btn-sm" data-close="camera-dialog">Cancel</button>
+            <button type="submit" id="btn-cam-save" class="btn btn-primary btn-sm">Save Camera</button>
+          </div>
+        </div>
+      </form>
     </div>
   </div>
 

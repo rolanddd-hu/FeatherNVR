@@ -10,14 +10,7 @@ try {
     }
 
     $cfg = Join-Path $root "config.yaml"
-    if (-not (Test-Path $cfg)) {
-        Write-Host "config.yaml not found." -ForegroundColor Yellow
-        Write-Host "Copy configs\config.example.yaml to config.yaml and edit your cameras first:" -ForegroundColor Yellow
-        Write-Host "  Copy-Item .\configs\config.example.yaml .\config.yaml"
-        exit 1
-    }
-
-    & $exe -config $cfg
+    & $exe -config $cfg @args
 }
 finally {
     Pop-Location

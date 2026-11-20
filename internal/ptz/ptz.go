@@ -77,3 +77,10 @@ func (m *Manager) Has(camID string) bool {
 	_, ok := m.Get(camID)
 	return ok
 }
+
+// Remove unregisters the PTZ controller for camID.
+func (m *Manager) Remove(camID string) {
+	m.mu.Lock()
+	delete(m.controllers, camID)
+	m.mu.Unlock()
+}

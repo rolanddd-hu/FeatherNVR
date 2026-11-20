@@ -106,10 +106,11 @@ const state = {
   storage: null,
   uptimeSec: 0,
   gridCols: localStorage.getItem('feathernvr_cols_v2') || 'fit',
+  recCols: localStorage.getItem('feathernvr_rec_cols_v1') || 'auto',
   cameraOrder: loadStoredCameraOrder(),
   editLayout: false,
   swapSelectedCam: null,
-  tiles: new Map(), // camID -> { el, stage, zoomCtrl, player, dot, recBadge, motBadge, ptzBadge, metaLeft, metaRight }
+  tiles: new Map(), // camID -> { el, stage, zoomCtrl, player, streamName, configRev, nameEl, dot, recBadge, motBadge, ptzBadge, metaLeft, metaRight }
   activeModalCam: null,
   activeModalQuality: 'sub',
   modalPlayer: null,
@@ -122,7 +123,14 @@ const state = {
   daySession: null,
   clipZoomCtrl: null,
   statusTimer: null,
-  recCameraPopulated: false,
+  recCameraSig: '',
+  contextMenuCam: null,
+  cameraDialog: {
+    mode: 'add',
+    id: null,
+    idManual: false,
+    ignoreZones: null,
+  },
 };
 
 const qs = (sel) => document.querySelector(sel);
@@ -177,6 +185,22 @@ function formatMMSS(sec) {
   const m = Math.floor(sec / 60);
   const s = sec % 60;
   return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function formatMMSSPrecise(sec) {
+  sec = Math.max(0, Number(sec) || 0);
+  const tenths = Math.round(sec * 10);
+  const m = Math.floor(tenths / 600);
+  const rem = (tenths % 600) / 10;
+  return `${m}:${rem.toFixed(1).padStart(4, '0')}`;
+}
+
+function slugifyCameraName(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'camera';
 }
 
 function escapeHTML(str) {
@@ -427,6 +451,7 @@ function switchTab(tabName) {
   }
   if (tabName === 'recordings') {
     loadRecordings(false);
+    requestAnimationFrame(updateRecFitLayout);
   }
 }
 
@@ -436,7 +461,8 @@ document.querySelectorAll('.nav-btn').forEach((btn) => {
 
 function syncBodyFitMode() {
   const liveActive = Boolean(qs('#tab-live')?.classList.contains('active'));
-  const fitActive = liveActive && state.gridCols === 'fit';
+  const recActive = Boolean(qs('#tab-recordings')?.classList.contains('active'));
+  const fitActive = (liveActive && state.gridCols === 'fit') || (recActive && state.recCols === 'fit');
   document.body.classList.toggle('fit-mode', fitActive);
   qs('.main-content')?.classList.toggle('fit-mode', fitActive);
 }
@@ -482,6 +508,58 @@ function updateFitLayout() {
   grid.style.gridTemplateRows = `repeat(${bestRows}, minmax(0, 1fr))`;
 }
 
+function updateRecFitLayout() {
+  syncBodyFitMode();
+  const grid = qs('#recordings-list');
+  if (!grid) return;
+  const recActive = Boolean(qs('#tab-recordings')?.classList.contains('active'));
+  if (state.recCols !== 'fit' || !recActive) {
+    grid.style.gridTemplateColumns = '';
+    grid.style.gridTemplateRows = '';
+    return;
+  }
+  const count = grid.querySelectorAll('.rec-card').length;
+  if (!count) {
+    grid.style.gridTemplateColumns = '';
+    grid.style.gridTemplateRows = '';
+    return;
+  }
+  const w = grid.clientWidth;
+  const h = grid.clientHeight;
+  if (w <= 0 || h <= 0) return;
+
+  const gap = parseFloat(getComputedStyle(grid).columnGap) || 6;
+  const aspect = 16 / 9;
+  const bodyReserveH = 44;
+  let bestCols = 1;
+  let bestRows = count;
+  let bestArea = -1;
+
+  for (let cols = 1; cols <= count; cols++) {
+    const rows = Math.ceil(count / cols);
+    const cellW = (w - gap * (cols - 1)) / cols;
+    const cellH = (h - gap * (rows - 1)) / rows;
+    if (cellW <= 0 || cellH <= 0) continue;
+    const thumbMaxH = Math.max(24, cellH - bodyReserveH);
+    const thumbW = Math.min(cellW, thumbMaxH * aspect);
+    const thumbH = thumbW / aspect;
+    const area = thumbW * thumbH;
+    if (area > bestArea + 0.5) {
+      bestArea = area;
+      bestCols = cols;
+      bestRows = rows;
+    }
+  }
+
+  grid.style.gridTemplateColumns = `repeat(${bestCols}, minmax(0, 1fr))`;
+  grid.style.gridTemplateRows = `repeat(${bestRows}, minmax(0, 1fr))`;
+}
+
+function updateAllFitLayouts() {
+  updateFitLayout();
+  updateRecFitLayout();
+}
+
 // Grid columns
 function applyGridCols(cols) {
   state.gridCols = cols;
@@ -489,21 +567,39 @@ function applyGridCols(cols) {
   const grid = qs('#camera-grid');
   grid.className = `camera-grid cols-${cols}`;
   grid.classList.toggle('editing', state.editLayout);
-  document.querySelectorAll('.col-selector .chip').forEach((c) => {
+  document.querySelectorAll('#live-col-selector .chip').forEach((c) => {
     c.classList.toggle('active', c.dataset.cols === cols);
   });
   updateFitLayout();
   requestAnimationFrame(updateFitLayout);
 }
 
-document.querySelectorAll('.col-selector .chip').forEach((c) => {
+function applyRecCols(cols) {
+  state.recCols = cols;
+  localStorage.setItem('feathernvr_rec_cols_v1', cols);
+  const grid = qs('#recordings-list');
+  if (grid) {
+    grid.className = `recordings-grid cols-${cols}`;
+  }
+  document.querySelectorAll('#rec-col-selector .chip').forEach((c) => {
+    c.classList.toggle('active', c.dataset.cols === cols);
+  });
+  updateRecFitLayout();
+  requestAnimationFrame(updateRecFitLayout);
+}
+
+document.querySelectorAll('#live-col-selector .chip').forEach((c) => {
   c.addEventListener('click', () => applyGridCols(c.dataset.cols));
 });
-window.addEventListener('resize', updateFitLayout);
+document.querySelectorAll('#rec-col-selector .chip').forEach((c) => {
+  c.addEventListener('click', () => applyRecCols(c.dataset.cols));
+});
+window.addEventListener('resize', updateAllFitLayouts);
 if (window.ResizeObserver && qs('.main-content')) {
-  new ResizeObserver(updateFitLayout).observe(qs('.main-content'));
+  new ResizeObserver(updateAllFitLayouts).observe(qs('.main-content'));
 }
 applyGridCols(state.gridCols);
+applyRecCols(state.recCols);
 
 // Camera layout order & Edit Layout mode
 function getEffectiveOrder(cameras) {
@@ -701,9 +797,48 @@ function attachTileDragHandlers(tile, cam) {
   });
 }
 
+function createGridPlayer(cam) {
+  const player = document.createElement('feathernvr-player');
+  player.setAttribute('grid', '');
+  player.pcConfig = { bundlePolicy: 'max-bundle', iceServers: [] };
+  player.mode = 'webrtc,mse,hls,mjpeg';
+  player.media = 'video';
+  player.visibilityThreshold = 0.15;
+  player.visibilityCheck = true;
+  if (player.video) {
+    player.video.style.objectFit = cam.aspect_ratio === 'fill' ? 'cover' : 'contain';
+  }
+  return player;
+}
+
 // Build/update live grid without tearing down existing video players
 function syncLiveGrid(cameras) {
   const grid = qs('#camera-grid');
+  if (!cameras.length) {
+    clearSwapSelection();
+    for (const ref of state.tiles.values()) {
+      if (typeof ref.player.ondisconnect === 'function') {
+        ref.player.ondisconnect();
+      }
+    }
+    state.tiles.clear();
+    grid.style.gridTemplateColumns = '';
+    grid.style.gridTemplateRows = '';
+    grid.innerHTML = '';
+    const empty = document.createElement('div');
+    empty.className = 'empty-grid-state';
+    empty.innerHTML = `
+      <h3>No cameras configured yet</h3>
+      <p class="muted">Click <strong>+ Add Camera</strong> to scan your LAN for ONVIF devices or add an RTSP stream.</p>
+      <button type="button" class="btn btn-primary" id="btn-empty-add-cam">+ Add Camera</button>
+    `;
+    empty.querySelector('#btn-empty-add-cam')?.addEventListener('click', () => openCameraDialog(null));
+    grid.appendChild(empty);
+    qs('#live-summary').textContent = '0 cameras';
+    return;
+  }
+
+  grid.querySelector('.empty-grid-state')?.remove();
   const nextIDs = cameras.map((c) => c.id);
   const changed = nextIDs.length !== state.tiles.size || nextIDs.some((id) => !state.tiles.has(id));
 
@@ -721,17 +856,14 @@ function syncLiveGrid(cameras) {
       const tile = document.createElement('div');
       tile.className = 'cam-tile';
       tile.dataset.camId = cam.id;
+      tile.classList.toggle('aspect-4-3', cam.aspect_ratio === '4:3');
+      tile.classList.toggle('aspect-fill', cam.aspect_ratio === 'fill');
 
       const stage = document.createElement('div');
       stage.className = 'zoom-stage';
 
-      const player = document.createElement('feathernvr-player');
-      player.setAttribute('grid', '');
-      player.pcConfig = { bundlePolicy: 'max-bundle', iceServers: [] };
-      player.mode = 'webrtc,mse,hls,mjpeg';
-      player.media = 'video';
-      player.visibilityThreshold = 0.15;
-      player.visibilityCheck = true;
+      const desiredStream = cam.live_stream === 'main' ? cam.stream_main : cam.stream_sub;
+      const player = createGridPlayer(cam);
 
       stage.appendChild(player);
 
@@ -777,17 +909,25 @@ function syncLiveGrid(cameras) {
         },
       });
       attachTileDragHandlers(tile, cam);
+      tile.addEventListener('contextmenu', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openCameraContextMenu(cam.id, ev.clientX, ev.clientY);
+      });
 
       grid.appendChild(tile);
 
       // Set src after connecting to DOM so isConnected is true.
-      player.src = wsStreamURL(cam.stream_sub);
+      player.src = wsStreamURL(desiredStream);
 
       state.tiles.set(cam.id, {
         el: tile,
         stage,
         zoomCtrl,
         player,
+        streamName: desiredStream,
+        configRev: cam.config_rev || 0,
+        nameEl: ovTop.querySelector('.name-text'),
         dot: ovTop.querySelector('.dot'),
         ptzBadge: ovTop.querySelector('.badge.ptz'),
         recBadge: ovTop.querySelector('.badge.rec'),
@@ -810,12 +950,39 @@ function syncLiveGrid(cameras) {
 
     const ref = state.tiles.get(cam.id);
     if (!ref) continue;
+    ref.nameEl.textContent = cam.name;
+    ref.el.classList.toggle('aspect-4-3', cam.aspect_ratio === '4:3');
+    ref.el.classList.toggle('aspect-fill', cam.aspect_ratio === 'fill');
+
+    const desiredStream = cam.live_stream === 'main' ? cam.stream_main : cam.stream_sub;
+    const rev = cam.config_rev || 0;
+    if (ref.streamName !== desiredStream || ref.configRev !== rev) {
+      ref.streamName = desiredStream;
+      ref.configRev = rev;
+      if (typeof ref.player?.ondisconnect === 'function') {
+        ref.player.ondisconnect();
+      }
+      ref.player?.remove();
+      const nextPlayer = createGridPlayer(cam);
+      ref.stage.appendChild(nextPlayer);
+      nextPlayer.src = wsStreamURL(desiredStream);
+      ref.player = nextPlayer;
+    } else if (ref.player?.video) {
+      ref.player.video.style.objectFit = cam.aspect_ratio === 'fill' ? 'cover' : 'contain';
+    }
+
     ref.dot.classList.toggle('online', !!cam.online);
     ref.ptzBadge.classList.toggle('hidden', !cam.ptz_enabled);
     ref.recBadge.classList.toggle('hidden', !cam.recording);
     ref.motBadge.classList.toggle('hidden', !cam.motion_active);
-    ref.metaLeft.textContent = cam.online ? `${cam.fps.toFixed(1)} fps · ${cam.bitrate_kbps.toFixed(0)} kbps` : 'Offline';
-    ref.metaRight.textContent = cam.motion_mode || '';
+
+    const resTag = (cam.width && cam.height)
+      ? `${cam.width}x${cam.height} · `
+      : (cam.resolution ? `${cam.resolution} · ` : '');
+    ref.metaLeft.textContent = cam.online
+      ? `${resTag}${cam.fps.toFixed(1)} fps · ${cam.bitrate_kbps.toFixed(0)} kbps`
+      : 'Offline';
+    ref.metaRight.textContent = `${cam.live_stream === 'main' ? 'MAIN' : 'SUB'} · ${cam.motion_mode || ''}`;
   }
 
   qs('#live-summary').textContent = `${onlineCount}/${cameras.length} online` + (recCount > 0 ? ` · ${recCount} recording` : '');
@@ -863,14 +1030,21 @@ function renderStatusTab(data) {
 }
 
 function populateRecCameras(cameras) {
-  if (state.recCameraPopulated || !cameras.length) return;
-  state.recCameraPopulated = true;
   const sel = qs('#rec-camera');
+  if (!sel) return;
+  const sig = cameras.map((c) => `${c.id}:${c.name}`).join('|');
+  if (state.recCameraSig === sig) return;
+  state.recCameraSig = sig;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">All Cameras</option>';
   for (const cam of cameras) {
     const opt = document.createElement('option');
     opt.value = cam.id;
     opt.textContent = cam.name;
     sel.appendChild(opt);
+  }
+  if (prev && cameras.some((c) => c.id === prev)) {
+    sel.value = prev;
   }
 }
 
@@ -966,7 +1140,7 @@ function openLiveModal(camID) {
   const cam = state.cameras.find((c) => c.id === camID);
   if (!cam) return;
   state.activeModalCam = camID;
-  state.activeModalQuality = 'sub';
+  state.activeModalQuality = cam.live_stream === 'main' ? 'main' : 'sub';
   state.ptzPanelExpanded = true;
 
   qs('#modal-live-title').textContent = cam.name;
@@ -1214,6 +1388,13 @@ qs('#btn-modal-fs').addEventListener('click', () => {
   toggleStreamFullscreen(qs('#live-modal'));
 });
 
+qs('#btn-modal-settings')?.addEventListener('click', () => {
+  const camID = state.activeModalCam;
+  if (!camID) return;
+  closeLiveModal();
+  openCameraDialog(camID);
+});
+
 qs('#btn-modal-rec').addEventListener('click', async () => {
   if (state.activeModalCam) {
     await triggerCamera(state.activeModalCam);
@@ -1286,8 +1467,12 @@ async function loadRecordings(append) {
   }
 
   const shown = state.recOffset + items.length;
+  const hasMore = shown < state.recTotal;
   qs('#rec-count-label').textContent = `${state.recTotal} camera-day(s)`;
-  qs('#rec-load-more').classList.toggle('hidden', shown >= state.recTotal);
+  qs('#rec-load-more').classList.toggle('hidden', !hasMore);
+  qs('#rec-load-more-wrap')?.classList.toggle('hidden', !hasMore);
+  updateRecFitLayout();
+  requestAnimationFrame(updateRecFitLayout);
 }
 
 qs('#rec-camera').addEventListener('change', () => loadRecordings(false));
@@ -1320,6 +1505,79 @@ if (qs('#modal-clip-player-wrap') && qs('#modal-clip-zoom-stage')) {
   );
 }
 
+const clipDeck = [qs('#modal-clip-video'), qs('#modal-clip-video-next')].filter(Boolean);
+let activeClipDeckIdx = 0;
+
+function getActiveClipVideo() {
+  return clipDeck[activeClipDeckIdx] || null;
+}
+
+function getStandbyClipVideo() {
+  return clipDeck.length > 1 ? clipDeck[1 - activeClipDeckIdx] : null;
+}
+
+function syncClipDeckClasses() {
+  clipDeck.forEach((el, idx) => {
+    const isActive = idx === activeClipDeckIdx;
+    el.classList.toggle('active', isActive);
+    el.classList.toggle('standby', !isActive);
+  });
+}
+
+function clearClipVideo(el) {
+  if (!el) return;
+  el.pause();
+  el.autoplay = false;
+  delete el.dataset.clipUrl;
+  delete el.dataset.clipIndex;
+  el.removeAttribute('src');
+  el.load();
+}
+
+function resetClipDeck() {
+  clipDeck.forEach(clearClipVideo);
+  activeClipDeckIdx = 0;
+  syncClipDeckClasses();
+}
+
+function preloadNextClip() {
+  const session = state.daySession;
+  const standby = getStandbyClipVideo();
+  if (!session || !standby) return;
+
+  const nextIdx = session.index + 1;
+  if (nextIdx >= session.clips.length) {
+    clearClipVideo(standby);
+    return;
+  }
+
+  const nextClip = session.clips[nextIdx];
+  if (!nextClip?.video_url) {
+    clearClipVideo(standby);
+    return;
+  }
+
+  if (standby.dataset.clipUrl === nextClip.video_url) {
+    standby.dataset.clipIndex = String(nextIdx);
+    standby.muted = true;
+    standby.playbackRate = session.playbackRate || 1;
+    if (standby.readyState >= 1 && standby.currentTime > 0.05) {
+      standby.currentTime = 0;
+    }
+    return;
+  }
+
+  standby.pause();
+  standby.autoplay = false;
+  standby.preload = 'auto';
+  standby.muted = true;
+  standby.dataset.clipUrl = nextClip.video_url;
+  standby.dataset.clipIndex = String(nextIdx);
+  standby.src = nextClip.video_url;
+  standby.playbackRate = session.playbackRate || 1;
+  standby.load();
+}
+
 async function openDayModal(day) {
   const params = new URLSearchParams({
     camera: day.camera_id,
@@ -1350,10 +1608,13 @@ async function openDayModal(day) {
     index: 0,
     tlMode: '24h',
     playbackRate: Number(qs('#clip-speed')?.value || 1),
+    muted: false,
     pendingSeek: 0,
     pendingAutoplay: true,
   };
 
+  resetClipDeck();
+  qs('#btn-clip-mute').textContent = 'Mute';
   state.clipZoomCtrl?.reset();
   qs('#clip-modal').classList.remove('hidden');
   renderDayTimeline();
@@ -1450,7 +1711,7 @@ function renderDayTimeline() {
 }
 
 function updateClipPlayButtons() {
-  const video = qs('#modal-clip-video');
+  const video = getActiveClipVideo();
   const session = state.daySession;
   const playBtn = qs('#btn-clip-play');
   const pausedPill = qs('#clip-paused-pill');
@@ -1483,13 +1744,14 @@ function updateDayPlayhead(overrideUnix = null) {
   }
 
   const clip = session.clips[session.index];
-  const video = qs('#modal-clip-video');
+  const video = getActiveClipVideo();
   const cur = Number.isFinite(video?.currentTime) ? video.currentTime : 0;
   const dur = Number.isFinite(video?.duration) && video.duration > 0 ? video.duration : (clip.duration_sec || 0);
   const wallUnix = overrideUnix ?? (clip.start_time + cur);
 
   qs('#tl-current-time').textContent = formatClockTime(wallUnix);
-  qs('#clip-time-readout').textContent = `${formatMMSS(cur)} / ${formatMMSS(dur)}`;
+  const curText = video?.paused ? formatMMSSPrecise(cur) : formatMMSS(cur);
+  qs('#clip-time-readout').textContent = `${curText} / ${formatMMSS(dur)}`;
 
   const { winStart, winEnd } = getTimelineWindow(session);
   const span = Math.max(1, winEnd - winStart);
@@ -1524,10 +1786,131 @@ function playDayClip(index, offsetSec = 0, autoplay = true) {
     seg.classList.toggle('active', Number(seg.dataset.clipIndex) === index);
   });
 
-  const video = qs('#modal-clip-video');
-  video.playbackRate = session.playbackRate || 1;
-  video.src = clip.video_url;
-  video.load();
+  const active = getActiveClipVideo();
+  const standby = getStandbyClipVideo();
+
+  // Case 1: Pre-buffered Standby Hit -> swap decks seamlessly
+  if (standby && standby.dataset.clipUrl === clip.video_url) {
+    active?.pause();
+    activeClipDeckIdx = 1 - activeClipDeckIdx;
+    syncClipDeckClasses();
+
+    const v = getActiveClipVideo();
+    if (v) {
+      v.muted = Boolean(session.muted);
+      v.playbackRate = session.playbackRate || 1;
+      v.autoplay = Boolean(autoplay);
+      if (v.readyState >= 1) {
+        if (session.pendingSeek > 0) {
+          const maxT = Number.isFinite(v.duration) && v.duration > 0 ? Math.max(0, v.duration - 0.05) : session.pendingSeek;
+          v.currentTime = Math.min(session.pendingSeek, maxT);
+        } else if (v.currentTime > 0.05) {
+          v.currentTime = 0;
+        }
+        session.pendingSeek = 0;
+        session.pendingAutoplay = false;
+        if (autoplay) {
+          const p = v.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch(() => {
+              session.muted = true;
+              v.muted = true;
+              qs('#btn-clip-mute').textContent = 'Unmute';
+              v.play().catch(() => {});
+            });
+          }
+        } else if (!v.paused) {
+          v.pause();
+        }
+        preloadNextClip();
+      }
+    }
+    updateClipPlayButtons();
+    updateDayPlayhead();
+    return;
+  }
+
+  // Case 2: Same clip already loaded on Active -> seek directly without reloading
+  if (active && active.dataset.clipUrl === clip.video_url && active.readyState >= 1) {
+    active.muted = Boolean(session.muted);
+    active.playbackRate = session.playbackRate || 1;
+    const maxT = Number.isFinite(active.duration) && active.duration > 0 ? Math.max(0, active.duration - 0.05) : session.pendingSeek;
+    active.currentTime = Math.min(session.pendingSeek, maxT);
+    session.pendingSeek = 0;
+    session.pendingAutoplay = false;
+    if (autoplay) {
+      const p = active.play();
+      if (p && typeof p.catch === 'function') {
+        p.catch(() => {
+          session.muted = true;
+          active.muted = true;
+          qs('#btn-clip-mute').textContent = 'Unmute';
+          active.play().catch(() => {});
+        });
+      }
+    } else if (!active.paused) {
+      active.pause();
+    }
+    preloadNextClip();
+    updateClipPlayButtons();
+    updateDayPlayhead();
+    return;
+  }
+
+  // Case 3: Cold load on Active (clear Standby so initial clip gets priority)
+  clearClipVideo(standby);
+  if (active) {
+    active.muted = Boolean(session.muted);
+    active.playbackRate = session.playbackRate || 1;
+    active.autoplay = Boolean(autoplay);
+    active.dataset.clipUrl = clip.video_url;
+    active.dataset.clipIndex = String(index);
+    active.src = clip.video_url;
+    active.load();
+  }
+  updateClipPlayButtons();
+  updateDayPlayhead();
+}
+
+function getCameraFrameStep(camID) {
+  const cam = state.cameras.find((c) => c.id === camID);
+  const fps = Number(cam?.fps);
+  const effFPS = Number.isFinite(fps) && fps >= 4 && fps <= 60 ? fps : 15;
+  return 1 / effFPS;
+}
+
+function stepDayFrame(dir) {
+  const session = state.daySession;
+  const video = getActiveClipVideo();
+  if (!session || !session.clips.length || !video) return;
+  if (!video.paused) {
+    video.pause();
+  }
+  const step = getCameraFrameStep(session.camera_id);
+  const dur = Number.isFinite(video.duration) && video.duration > 0
+    ? video.duration
+    : (session.clips[session.index]?.duration_sec || 0);
+  const cur = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+  const target = cur + dir * step;
+
+  if (dir < 0 && target < 0) {
+    if (session.index > 0) {
+      const prevClip = session.clips[session.index - 1];
+      const prevDur = Number(prevClip?.duration_sec) || 0;
+      playDayClip(session.index - 1, Math.max(0, prevDur - step), false);
+      return;
+    }
+    video.currentTime = 0;
+  } else if (dir > 0 && dur > 0 && target >= dur - 0.005) {
+    if (session.index < session.clips.length - 1) {
+      playDayClip(session.index + 1, 0, false);
+      return;
+    }
+    video.currentTime = Math.max(0, dur - 0.005);
+  } else {
+    const maxT = dur > 0 ? Math.max(0, dur - 0.005) : target;
+    video.currentTime = Math.max(0, Math.min(maxT, target));
+  }
   updateClipPlayButtons();
   updateDayPlayhead();
 }
@@ -1554,7 +1937,7 @@ function seekDayTimeline(targetUnix) {
   const session = state.daySession;
   if (!session || !session.clips.length) return;
   const hit = findClipForUnix(session, targetUnix);
-  const video = qs('#modal-clip-video');
+  const video = getActiveClipVideo();
   if (hit.index === session.index && video?.readyState >= 1) {
     const maxT = Number.isFinite(video.duration) && video.duration > 0 ? Math.max(0, video.duration - 0.05) : hit.offset;
     video.currentTime = Math.max(0, Math.min(maxT, hit.offset));
@@ -1567,36 +1950,72 @@ function seekDayTimeline(targetUnix) {
   }
 }
 
-const clipVideoEl = qs('#modal-clip-video');
-clipVideoEl?.addEventListener('loadedmetadata', () => {
-  const session = state.daySession;
-  if (!session) return;
-  clipVideoEl.playbackRate = session.playbackRate || 1;
-  if (session.pendingSeek > 0) {
-    const maxT = Number.isFinite(clipVideoEl.duration) && clipVideoEl.duration > 0
-      ? Math.max(0, clipVideoEl.duration - 0.05)
-      : session.pendingSeek;
-    clipVideoEl.currentTime = Math.min(session.pendingSeek, maxT);
-    session.pendingSeek = 0;
-  }
-  if (session.pendingAutoplay) {
-    session.pendingAutoplay = false;
-    clipVideoEl.play().catch(() => {});
-  }
-  updateClipPlayButtons();
-  updateDayPlayhead();
-});
-
-clipVideoEl?.addEventListener('timeupdate', () => updateDayPlayhead());
-clipVideoEl?.addEventListener('play', updateClipPlayButtons);
-clipVideoEl?.addEventListener('pause', updateClipPlayButtons);
-clipVideoEl?.addEventListener('ended', () => {
-  const session = state.daySession;
-  if (session && session.index < session.clips.length - 1) {
-    playDayClip(session.index + 1, 0, true);
-  } else {
+clipDeck.forEach((videoEl) => {
+  videoEl.addEventListener('loadedmetadata', () => {
+    if (videoEl !== getActiveClipVideo()) return;
+    const session = state.daySession;
+    if (!session) return;
+    videoEl.playbackRate = session.playbackRate || 1;
+    videoEl.muted = Boolean(session.muted);
+    if (session.pendingSeek > 0) {
+      const maxT = Number.isFinite(videoEl.duration) && videoEl.duration > 0
+        ? Math.max(0, videoEl.duration - 0.05)
+        : session.pendingSeek;
+      videoEl.currentTime = Math.min(session.pendingSeek, maxT);
+      session.pendingSeek = 0;
+    }
+    if (session.pendingAutoplay) {
+      session.pendingAutoplay = false;
+      const p = videoEl.play();
+      if (p && typeof p.catch === 'function') {
+        p.catch(() => {
+          session.muted = true;
+          videoEl.muted = true;
+          qs('#btn-clip-mute').textContent = 'Unmute';
+          videoEl.play().catch(() => {});
+        });
+      }
+    } else if (!videoEl.paused) {
+      videoEl.pause();
+    }
     updateClipPlayButtons();
-  }
+    updateDayPlayhead();
+    if (videoEl.readyState >= 2) {
+      preloadNextClip();
+    }
+  });
+
+  videoEl.addEventListener('loadeddata', () => {
+    if (videoEl !== getActiveClipVideo()) return;
+    preloadNextClip();
+  });
+
+  videoEl.addEventListener('timeupdate', () => {
+    if (videoEl !== getActiveClipVideo()) return;
+    updateDayPlayhead();
+  });
+  videoEl.addEventListener('seeked', () => {
+    if (videoEl !== getActiveClipVideo()) return;
+    updateDayPlayhead();
+  });
+  videoEl.addEventListener('play', () => {
+    if (videoEl !== getActiveClipVideo()) return;
+    updateClipPlayButtons();
+  });
+  videoEl.addEventListener('pause', () => {
+    if (videoEl !== getActiveClipVideo()) return;
+    updateClipPlayButtons();
+    updateDayPlayhead();
+  });
+  videoEl.addEventListener('ended', () => {
+    if (videoEl !== getActiveClipVideo()) return;
+    const session = state.daySession;
+    if (session && session.index < session.clips.length - 1) {
+      playDayClip(session.index + 1, 0, true);
+    } else {
+      updateClipPlayButtons();
+    }
+  });
 });
 
 // Timeline track hover, scrub & desktop mouse-wheel zoom in 24h mode
@@ -1743,6 +2162,9 @@ qs('#btn-clip-prev')?.addEventListener('click', () => {
   }
 });
 
+qs('#btn-clip-prev-frame')?.addEventListener('click', () => stepDayFrame(-1));
+qs('#btn-clip-next-frame')?.addEventListener('click', () => stepDayFrame(1));
+
 qs('#btn-clip-next')?.addEventListener('click', () => {
   if (state.daySession && state.daySession.index < state.daySession.clips.length - 1) {
     playDayClip(state.daySession.index + 1, 0, true);
@@ -1750,7 +2172,7 @@ qs('#btn-clip-next')?.addEventListener('click', () => {
 });
 
 qs('#btn-clip-play')?.addEventListener('click', () => {
-  const video = qs('#modal-clip-video');
+  const video = getActiveClipVideo();
   const session = state.daySession;
   if (!video || !session) return;
   if (video.ended && session.index >= session.clips.length - 1) {
@@ -1767,13 +2189,16 @@ qs('#btn-clip-play')?.addEventListener('click', () => {
 qs('#clip-speed')?.addEventListener('change', (ev) => {
   const rate = Number(ev.target.value) || 1;
   if (state.daySession) state.daySession.playbackRate = rate;
-  if (clipVideoEl) clipVideoEl.playbackRate = rate;
+  clipDeck.forEach((el) => { el.playbackRate = rate; });
 });
 
 qs('#btn-clip-mute')?.addEventListener('click', () => {
-  if (!clipVideoEl) return;
-  clipVideoEl.muted = !clipVideoEl.muted;
-  qs('#btn-clip-mute').textContent = clipVideoEl.muted ? 'Unmute' : 'Mute';
+  const video = getActiveClipVideo();
+  if (!video) return;
+  const nextMuted = !video.muted;
+  video.muted = nextMuted;
+  if (state.daySession) state.daySession.muted = nextMuted;
+  qs('#btn-clip-mute').textContent = nextMuted ? 'Unmute' : 'Mute';
 });
 
 qs('#btn-clip-fs')?.addEventListener('click', () => {
@@ -1783,12 +2208,7 @@ qs('#btn-clip-fs')?.addEventListener('click', () => {
 function closeClipModal() {
   exitStreamFullscreen(qs('#clip-modal'));
   state.clipZoomCtrl?.reset();
-  const video = qs('#modal-clip-video');
-  if (video) {
-    video.pause();
-    video.removeAttribute('src');
-    video.load();
-  }
+  resetClipDeck();
   state.daySession = null;
   qs('#clip-modal').classList.add('hidden');
 }
@@ -1854,8 +2274,19 @@ document.querySelectorAll('[data-close="live-modal"]').forEach((el) => {
 document.querySelectorAll('[data-close="clip-modal"]').forEach((el) => {
   el.addEventListener('click', closeClipModal);
 });
+document.querySelectorAll('[data-close="camera-dialog"]').forEach((el) => {
+  el.addEventListener('click', closeCameraDialog);
+});
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') {
+    if (!qs('#cam-context-menu')?.classList.contains('hidden')) {
+      closeCameraContextMenu();
+      return;
+    }
+    if (!qs('#camera-dialog')?.classList.contains('hidden')) {
+      closeCameraDialog();
+      return;
+    }
     if (isStreamFullscreen(qs('#live-modal'))) {
       exitStreamFullscreen(qs('#live-modal'));
       return;
@@ -1870,6 +2301,7 @@ document.addEventListener('keydown', (ev) => {
   }
   const tag = ev.target?.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  if (!qs('#camera-dialog')?.classList.contains('hidden')) return;
 
   if (ev.key === '0') {
     if (state.activeModalCam) state.liveZoomCtrl?.reset();
@@ -1877,37 +2309,48 @@ document.addEventListener('keydown', (ev) => {
     return;
   }
 
-  if (!state.daySession || !clipVideoEl) return;
+  const activeVideo = getActiveClipVideo();
+  if (!state.daySession || !activeVideo) return;
+  if (ev.key === ',') {
+    ev.preventDefault();
+    stepDayFrame(-1);
+    return;
+  }
+  if (ev.key === '.') {
+    ev.preventDefault();
+    stepDayFrame(1);
+    return;
+  }
   if (ev.key === ' ' || ev.code === 'Space') {
     if (tag === 'BUTTON' || tag === 'A') return;
     ev.preventDefault();
-    if (clipVideoEl.ended && state.daySession.index >= state.daySession.clips.length - 1) {
+    if (activeVideo.ended && state.daySession.index >= state.daySession.clips.length - 1) {
       playDayClip(0, 0, true);
-    } else if (clipVideoEl.paused) {
-      clipVideoEl.play().catch(() => {});
+    } else if (activeVideo.paused) {
+      activeVideo.play().catch(() => {});
     } else {
-      clipVideoEl.pause();
+      activeVideo.pause();
     }
   } else if (ev.key === 'ArrowLeft') {
     ev.preventDefault();
-    const nextT = clipVideoEl.currentTime - 5;
+    const nextT = activeVideo.currentTime - 5;
     if (nextT >= 0) {
-      clipVideoEl.currentTime = nextT;
+      activeVideo.currentTime = nextT;
       updateDayPlayhead();
     } else if (state.daySession.index > 0) {
       const prevClip = state.daySession.clips[state.daySession.index - 1];
       const prevDur = prevClip.duration_sec || 0;
       playDayClip(state.daySession.index - 1, Math.max(0, prevDur + nextT), true);
     } else {
-      clipVideoEl.currentTime = 0;
+      activeVideo.currentTime = 0;
       updateDayPlayhead();
     }
   } else if (ev.key === 'ArrowRight') {
     ev.preventDefault();
-    const dur = Number.isFinite(clipVideoEl.duration) ? clipVideoEl.duration : (state.daySession.clips[state.daySession.index]?.duration_sec || 0);
-    const nextT = clipVideoEl.currentTime + 5;
+    const dur = Number.isFinite(activeVideo.duration) ? activeVideo.duration : (state.daySession.clips[state.daySession.index]?.duration_sec || 0);
+    const nextT = activeVideo.currentTime + 5;
     if (nextT < dur) {
-      clipVideoEl.currentTime = nextT;
+      activeVideo.currentTime = nextT;
       updateDayPlayhead();
     } else if (state.daySession.index < state.daySession.clips.length - 1) {
       playDayClip(state.daySession.index + 1, 0, true);
@@ -1955,6 +2398,707 @@ qs('#btn-save-cap').addEventListener('click', async () => {
     msg.textContent = err.message;
   } finally {
     btn.disabled = false;
+  }
+});
+
+// Right-click Camera Context Menu & Unified Add/Edit Camera Dialog
+function closeCameraContextMenu() {
+  state.contextMenuCam = null;
+  qs('#cam-context-menu')?.classList.add('hidden');
+}
+
+function openCameraContextMenu(camID, x, y) {
+  const menu = qs('#cam-context-menu');
+  const cam = state.cameras.find((c) => c.id === camID);
+  if (!menu || !cam) return;
+
+  state.contextMenuCam = camID;
+  qs('#ctx-cam-name').textContent = cam.name || camID;
+  const toggleBtn = qs('#ctx-toggle-stream');
+  if (toggleBtn) {
+    toggleBtn.textContent = cam.live_stream === 'main'
+      ? 'Switch Live to Sub Stream'
+      : 'Switch Live to Main Stream';
+  }
+
+  menu.style.left = '0px';
+  menu.style.top = '0px';
+  menu.classList.remove('hidden');
+
+  const rect = menu.getBoundingClientRect();
+  const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
+  const top = Math.max(8, Math.min(y, window.innerHeight - rect.height - 8));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function dtoToUpdatePayload(dto, overrides = {}) {
+  const m = dto.motion || {};
+  const p = dto.ptz || {};
+  return {
+    id: dto.id,
+    name: dto.name,
+    enabled: Boolean(dto.enabled),
+    main_rtsp: dto.main_rtsp || '',
+    sub_rtsp: dto.sub_rtsp || '',
+    username: dto.username || '',
+    password: '',
+    live_stream: overrides.live_stream ?? (dto.live_stream || 'sub'),
+    resolution: dto.resolution || '',
+    aspect_ratio: dto.aspect_ratio || '',
+    pre_record_sec: dto.pre_record_sec ?? null,
+    post_record_sec: dto.post_record_sec ?? null,
+    max_clip_sec: dto.max_clip_sec ?? null,
+    motion: {
+      mode: m.mode || 'pixel',
+      onvif_url: m.onvif_url || '',
+      username: m.username || '',
+      password: '',
+      keep_password: true,
+      dvr: m.dvr || '',
+      channel: m.channel || 0,
+      fps: m.fps || 3,
+      width: m.width || 320,
+      height: m.height || 180,
+      threshold: m.threshold || 25,
+      min_area_percent: m.min_area_percent || 1.2,
+      max_area_percent: m.max_area_percent || 85,
+      min_frames: m.min_frames || 2,
+      ignore_zones: m.ignore_zones || null,
+    },
+    ptz: {
+      enabled: Boolean(p.enabled),
+      type: p.type || 'onvif',
+      url: p.url || '',
+      username: p.username || '',
+      password: '',
+      keep_password: true,
+      profile_token: p.profile_token || '',
+      channel: p.channel || 0,
+    },
+  };
+}
+
+async function toggleCameraLiveStream(camID) {
+  const res = await fetch(`/api/cameras/${encodeURIComponent(camID)}`, { cache: 'no-store' });
+  if (!res.ok) return;
+  const dto = await res.json();
+  const nextLive = dto.live_stream === 'main' ? 'sub' : 'main';
+  const putRes = await fetch(`/api/cameras/${encodeURIComponent(camID)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(dtoToUpdatePayload(dto, { live_stream: nextLive })),
+  });
+  if (putRes.ok) {
+    pollStatus();
+  }
+}
+
+async function deleteCameraByID(camID) {
+  const cam = state.cameras.find((c) => c.id === camID);
+  const label = cam?.name || camID;
+  if (!confirm(`Remove camera "${label}" from config? Existing recorded clips will be kept on disk.`)) {
+    return false;
+  }
+  const res = await fetch(`/api/cameras/${encodeURIComponent(camID)}`, { method: 'DELETE' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const errEl = qs('#cam-dlg-error');
+    if (errEl && !qs('#camera-dialog')?.classList.contains('hidden')) {
+      errEl.textContent = data.error || `Delete failed (HTTP ${res.status})`;
+    } else {
+      alert(data.error || `Delete failed (HTTP ${res.status})`);
+    }
+    return false;
+  }
+  if (state.activeModalCam === camID) closeLiveModal();
+  if (state.cameraDialog.id === camID && !qs('#camera-dialog')?.classList.contains('hidden')) {
+    closeCameraDialog();
+  }
+  pollStatus();
+  return true;
+}
+
+qs('#cam-context-menu')?.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('[data-ctx-action]');
+  if (!btn) return;
+  const action = btn.dataset.ctxAction;
+  const camID = state.contextMenuCam;
+  closeCameraContextMenu();
+  if (!camID) return;
+
+  switch (action) {
+    case 'settings':
+      openCameraDialog(camID);
+      break;
+    case 'open':
+      openLiveModal(camID);
+      break;
+    case 'toggle-stream':
+      await toggleCameraLiveStream(camID);
+      break;
+    case 'record':
+      await triggerCamera(camID);
+      pollStatus();
+      break;
+    case 'delete':
+      await deleteCameraByID(camID);
+      break;
+  }
+});
+
+window.addEventListener('pointerdown', (ev) => {
+  const menu = qs('#cam-context-menu');
+  if (menu && !menu.classList.contains('hidden') && !menu.contains(ev.target)) {
+    closeCameraContextMenu();
+  }
+});
+window.addEventListener('scroll', closeCameraContextMenu, true);
+window.addEventListener('resize', closeCameraContextMenu);
+document.addEventListener('contextmenu', (ev) => {
+  if (!ev.target.closest('.cam-tile')) {
+    closeCameraContextMenu();
+  }
+});
+
+function extractHostPort(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { host: '', port: '' };
+  try {
+    const withScheme = s.includes('://') ? s : `http://${s}`;
+    const u = new URL(withScheme);
+    return { host: u.hostname || '', port: u.port || '' };
+  } catch {
+    return { host: '', port: '' };
+  }
+}
+
+function updateCameraFormVisibility() {
+  const mode = qs('#cam-motion-mode')?.value || 'pixel';
+  const showONVIF = mode === 'onvif' || mode === 'onvif_or_pixel';
+  const showDVR = mode === 'hikvision_isapi' || mode === 'isapi_or_pixel';
+  const showPixel = mode === 'pixel' || mode === 'onvif_or_pixel' || mode === 'isapi_or_pixel';
+
+  qs('#cam-motion-onvif-group')?.classList.toggle('hidden', !showONVIF);
+  qs('#cam-motion-dvr-group')?.classList.toggle('hidden', !showDVR);
+  qs('#cam-motion-pixel-group')?.classList.toggle('hidden', !showPixel);
+
+  const ptzEnabled = Boolean(qs('#cam-ptz-enabled')?.checked);
+  const ptzType = qs('#cam-ptz-type')?.value || 'onvif';
+  qs('#cam-ptz-group')?.classList.toggle('hidden', !ptzEnabled);
+  qs('.ptz-onvif-field')?.classList.toggle('hidden', ptzType === 'hikvision_isapi');
+  qs('.ptz-isapi-field')?.classList.toggle('hidden', ptzType !== 'hikvision_isapi');
+}
+
+function populateDVRSelect(dvrs, selectedID = '') {
+  const sel = qs('#cam-motion-dvr');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">Select DVR...</option>';
+  const seen = new Set();
+  for (const d of dvrs || []) {
+    seen.add(d.id);
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = d.host ? `${d.id} (${d.host}:${d.port || 80})` : d.id;
+    sel.appendChild(opt);
+  }
+  if (selectedID && !seen.has(selectedID)) {
+    const opt = document.createElement('option');
+    opt.value = selectedID;
+    opt.textContent = selectedID;
+    sel.appendChild(opt);
+  }
+  sel.value = selectedID || (dvrs?.length === 1 ? dvrs[0].id : '');
+}
+
+function closeCameraDialog() {
+  qs('#camera-dialog')?.classList.add('hidden');
+  qs('#cam-dlg-error').textContent = '';
+}
+
+async function openCameraDialog(camID = null) {
+  closeCameraContextMenu();
+  const isEdit = Boolean(camID);
+  state.cameraDialog = {
+    mode: isEdit ? 'edit' : 'add',
+    id: camID,
+    idManual: isEdit,
+    ignoreZones: null,
+  };
+
+  qs('#cam-dlg-title').textContent = isEdit ? 'Camera Settings' : 'Add Camera';
+  qs('#cam-dlg-subtitle').textContent = isEdit
+    ? `Editing camera "${camID}" · Saves to config.yaml and hot-reloads streams`
+    : 'Auto-detect ONVIF streams, test connectivity, and save without restarting.';
+  qs('#cam-dlg-error').textContent = '';
+  qs('#cam-scan-status').textContent = '';
+  qs('#cam-scan-results').innerHTML = '';
+  qs('#cam-scan-results').classList.add('hidden');
+  qs('#cam-probe-status').textContent = '';
+  qs('#cam-probe-profiles').innerHTML = '';
+  qs('#cam-probe-profiles').classList.add('hidden');
+  qs('#cam-test-preview').classList.add('hidden');
+  qs('#cam-test-img').classList.add('hidden');
+  qs('#cam-test-img').removeAttribute('src');
+  qs('#cam-test-meta').textContent = '';
+  qs('#cam-test-msg').textContent = '';
+
+  let dvrs = [];
+  let dto = null;
+  try {
+    const listReq = fetch('/api/cameras', { cache: 'no-store' });
+    const detailReq = isEdit ? fetch(`/api/cameras/${encodeURIComponent(camID)}`, { cache: 'no-store' }) : Promise.resolve(null);
+    const [listRes, detailRes] = await Promise.all([listReq, detailReq]);
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      dvrs = listData.dvrs || [];
+    }
+    if (isEdit) {
+      if (!detailRes || !detailRes.ok) {
+        alert(`Failed to load camera settings (HTTP ${detailRes?.status || 'err'})`);
+        return;
+      }
+      dto = await detailRes.json();
+    }
+  } catch (err) {
+    alert(`Failed to load camera dialog: ${err.message}`);
+    return;
+  }
+
+  const idInput = qs('#cam-id');
+  const delBtn = qs('#btn-cam-delete');
+  if (isEdit && dto) {
+    state.cameraDialog.ignoreZones = dto.motion?.ignore_zones || null;
+    const inferred = extractHostPort(dto.motion?.onvif_url || dto.ptz?.url || dto.main_rtsp || dto.sub_rtsp);
+    qs('#cam-probe-host').value = inferred.host;
+    qs('#cam-probe-port').value = dto.motion?.onvif_url && inferred.port ? inferred.port : '80';
+    qs('#cam-user').value = dto.username || '';
+    qs('#cam-pass').value = '';
+    qs('#cam-pass').placeholder = (dto.has_main_password || dto.has_sub_password)
+      ? 'Saved (leave blank to keep)'
+      : 'Enter password';
+
+    qs('#cam-name').value = dto.name || '';
+    idInput.value = dto.id || '';
+    idInput.disabled = true;
+    qs('#cam-enabled').checked = Boolean(dto.enabled);
+    qs('#cam-main-rtsp').value = dto.main_rtsp || '';
+    qs('#cam-sub-rtsp').value = dto.sub_rtsp || '';
+    qs('#cam-live-stream').value = dto.live_stream || 'sub';
+    qs('#cam-resolution').value = dto.resolution || '';
+    qs('#cam-aspect-ratio').value = dto.aspect_ratio || '';
+
+    const m = dto.motion || {};
+    qs('#cam-motion-mode').value = m.mode || 'pixel';
+    qs('#cam-motion-onvif-url').value = m.onvif_url || '';
+    qs('#cam-motion-user').value = m.username || '';
+    qs('#cam-motion-pass').value = '';
+    qs('#cam-motion-pass').placeholder = m.has_password ? 'Saved (leave blank to keep)' : 'Leave blank to share camera password';
+    populateDVRSelect(dvrs, m.dvr || '');
+    qs('#cam-motion-channel').value = m.channel ? String(m.channel) : '1';
+    qs('#cam-motion-fps').value = String(m.fps || 3);
+    qs('#cam-motion-width').value = String(m.width || 320);
+    qs('#cam-motion-height').value = String(m.height || 180);
+    qs('#cam-motion-threshold').value = String(m.threshold || 25);
+    qs('#cam-motion-min-area').value = String(m.min_area_percent || 1.2);
+    qs('#cam-motion-max-area').value = String(m.max_area_percent || 85);
+    qs('#cam-motion-min-frames').value = String(m.min_frames || 2);
+
+    qs('#cam-pre-rec').value = dto.pre_record_sec ?? '';
+    qs('#cam-post-rec').value = dto.post_record_sec ?? '';
+    qs('#cam-max-clip').value = dto.max_clip_sec ?? '';
+
+    const p = dto.ptz || {};
+    qs('#cam-ptz-enabled').checked = Boolean(p.enabled);
+    qs('#cam-ptz-type').value = p.type || 'onvif';
+    qs('#cam-ptz-url').value = p.url || '';
+    qs('#cam-ptz-user').value = p.username || '';
+    qs('#cam-ptz-pass').value = '';
+    qs('#cam-ptz-pass').placeholder = p.has_password ? 'Saved (leave blank to keep)' : 'Leave blank to share camera password';
+    qs('#cam-ptz-token').value = p.profile_token || '';
+    qs('#cam-ptz-channel').value = p.channel ? String(p.channel) : '';
+
+    delBtn?.classList.remove('hidden');
+  } else {
+    qs('#cam-probe-host').value = '';
+    qs('#cam-probe-port').value = '80';
+    qs('#cam-user').value = '';
+    qs('#cam-pass').value = '';
+    qs('#cam-pass').placeholder = 'Enter password';
+
+    qs('#cam-name').value = '';
+    idInput.value = '';
+    idInput.disabled = false;
+    qs('#cam-enabled').checked = true;
+    qs('#cam-main-rtsp').value = '';
+    qs('#cam-sub-rtsp').value = '';
+    qs('#cam-live-stream').value = 'sub';
+    qs('#cam-resolution').value = '';
+    qs('#cam-aspect-ratio').value = '';
+
+    qs('#cam-motion-mode').value = 'pixel';
+    qs('#cam-motion-onvif-url').value = '';
+    qs('#cam-motion-user').value = '';
+    qs('#cam-motion-pass').value = '';
+    qs('#cam-motion-pass').placeholder = 'Leave blank to share camera password';
+    populateDVRSelect(dvrs, '');
+    qs('#cam-motion-channel').value = '1';
+    qs('#cam-motion-fps').value = '3';
+    qs('#cam-motion-width').value = '320';
+    qs('#cam-motion-height').value = '180';
+    qs('#cam-motion-threshold').value = '25';
+    qs('#cam-motion-min-area').value = '1.2';
+    qs('#cam-motion-max-area').value = '85';
+    qs('#cam-motion-min-frames').value = '2';
+
+    qs('#cam-pre-rec').value = '';
+    qs('#cam-post-rec').value = '';
+    qs('#cam-max-clip').value = '';
+
+    qs('#cam-ptz-enabled').checked = false;
+    qs('#cam-ptz-type').value = 'onvif';
+    qs('#cam-ptz-url').value = '';
+    qs('#cam-ptz-user').value = '';
+    qs('#cam-ptz-pass').value = '';
+    qs('#cam-ptz-pass').placeholder = 'Leave blank to share camera password';
+    qs('#cam-ptz-token').value = '';
+    qs('#cam-ptz-channel').value = '';
+
+    delBtn?.classList.add('hidden');
+  }
+
+  updateCameraFormVisibility();
+  qs('#camera-dialog')?.classList.remove('hidden');
+}
+
+qs('#btn-add-camera')?.addEventListener('click', () => openCameraDialog(null));
+qs('#cam-motion-mode')?.addEventListener('change', updateCameraFormVisibility);
+qs('#cam-ptz-enabled')?.addEventListener('change', updateCameraFormVisibility);
+qs('#cam-ptz-type')?.addEventListener('change', updateCameraFormVisibility);
+
+qs('#cam-name')?.addEventListener('input', () => {
+  if (state.cameraDialog.mode === 'add' && !state.cameraDialog.idManual) {
+    const v = qs('#cam-name').value;
+    qs('#cam-id').value = v.trim() ? slugifyCameraName(v) : '';
+  }
+});
+
+qs('#cam-id')?.addEventListener('input', () => {
+  state.cameraDialog.idManual = qs('#cam-id').value.trim() !== '';
+});
+
+qs('#btn-cam-scan-lan')?.addEventListener('click', async () => {
+  const btn = qs('#btn-cam-scan-lan');
+  const status = qs('#cam-scan-status');
+  const box = qs('#cam-scan-results');
+  btn.disabled = true;
+  status.textContent = 'Scanning LAN (3s)...';
+  box.innerHTML = '';
+  box.classList.add('hidden');
+  try {
+    const res = await fetch('/api/discover', { cache: 'no-store' });
+    const data = await res.json();
+    const devs = data.devices || [];
+    if (!devs.length) {
+      status.textContent = 'No ONVIF devices found.';
+      return;
+    }
+    status.textContent = `Found ${devs.length} device(s) — click to fill host:`;
+    box.classList.remove('hidden');
+    for (const dev of devs) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'scan-chip';
+      chip.textContent = `${dev.name || 'ONVIF Camera'} (${dev.ip})`;
+      chip.addEventListener('click', () => {
+        const xaddr = (dev.xaddrs || [])[0] || '';
+        if (xaddr) {
+          qs('#cam-probe-host').value = xaddr;
+          const parsed = extractHostPort(xaddr);
+          if (parsed.port) qs('#cam-probe-port').value = parsed.port;
+        } else {
+          qs('#cam-probe-host').value = dev.ip || '';
+        }
+        if (!qs('#cam-name').value.trim() && dev.name) {
+          qs('#cam-name').value = dev.name;
+          qs('#cam-name').dispatchEvent(new Event('input'));
+        }
+      });
+      box.appendChild(chip);
+    }
+  } catch (err) {
+    status.textContent = `Scan error: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+qs('#btn-cam-autodetect')?.addEventListener('click', async () => {
+  const btn = qs('#btn-cam-autodetect');
+  const status = qs('#cam-probe-status');
+  const profBox = qs('#cam-probe-profiles');
+
+  let host = qs('#cam-probe-host').value.trim();
+  if (!host) {
+    const fallback = extractHostPort(qs('#cam-motion-onvif-url').value || qs('#cam-main-rtsp').value);
+    host = fallback.host;
+    if (host) qs('#cam-probe-host').value = host;
+  }
+  if (!host) {
+    status.textContent = 'Enter a Camera Host / IP / ONVIF URL first.';
+    return;
+  }
+
+  btn.disabled = true;
+  status.textContent = 'Probing ONVIF capabilities & stream URIs...';
+  profBox.innerHTML = '';
+  profBox.classList.add('hidden');
+
+  try {
+    const res = await fetch('/api/cameras/probe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        host,
+        port: Number(qs('#cam-probe-port').value) || 80,
+        username: qs('#cam-user').value.trim(),
+        password: qs('#cam-pass').value,
+        camera_id: state.cameraDialog.mode === 'edit' ? state.cameraDialog.id : '',
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      status.textContent = data.error || `Probe failed (HTTP ${res.status})`;
+      return;
+    }
+
+    if (!qs('#cam-name').value.trim() && data.name) {
+      qs('#cam-name').value = data.name;
+      qs('#cam-name').dispatchEvent(new Event('input'));
+    }
+    if (data.main_rtsp) qs('#cam-main-rtsp').value = data.main_rtsp;
+    if (data.sub_rtsp) qs('#cam-sub-rtsp').value = data.sub_rtsp;
+    if (data.onvif_url) qs('#cam-motion-onvif-url').value = data.onvif_url;
+    if (data.suggested_motion_mode) qs('#cam-motion-mode').value = data.suggested_motion_mode;
+
+    qs('#cam-ptz-enabled').checked = Boolean(data.ptz_enabled);
+    if (data.ptz_enabled) {
+      qs('#cam-ptz-type').value = data.ptz_type || 'onvif';
+      if (data.ptz_url) qs('#cam-ptz-url').value = data.ptz_url;
+      if (data.ptz_profile_token) qs('#cam-ptz-token').value = data.ptz_profile_token;
+      if (data.ptz_channel) qs('#cam-ptz-channel').value = String(data.ptz_channel);
+    }
+
+    const profiles = data.profiles || [];
+    if (profiles.length) {
+      const mainProf = profiles.find((p) => p.rtsp_url === data.main_rtsp) || profiles[0];
+      if (mainProf?.width && mainProf?.height) {
+        qs('#cam-resolution').value = `${mainProf.width}x${mainProf.height}`;
+      }
+      profBox.classList.remove('hidden');
+      for (const p of profiles) {
+        const card = document.createElement('div');
+        card.className = 'probe-profile-card';
+        const info = document.createElement('span');
+        const spec = [
+          p.name || p.token,
+          p.width && p.height ? `${p.width}x${p.height}` : '',
+          p.codec || '',
+          p.fps ? `${p.fps}fps` : '',
+        ].filter(Boolean).join(' · ');
+        info.textContent = spec;
+
+        const actions = document.createElement('div');
+        actions.className = 'probe-profile-actions';
+        const useMain = document.createElement('button');
+        useMain.type = 'button';
+        useMain.className = 'btn btn-secondary btn-sm';
+        useMain.textContent = 'Main';
+        useMain.addEventListener('click', () => {
+          qs('#cam-main-rtsp').value = p.rtsp_url || '';
+          if (p.width && p.height) qs('#cam-resolution').value = `${p.width}x${p.height}`;
+        });
+        const useSub = document.createElement('button');
+        useSub.type = 'button';
+        useSub.className = 'btn btn-secondary btn-sm';
+        useSub.textContent = 'Sub';
+        useSub.addEventListener('click', () => {
+          qs('#cam-sub-rtsp').value = p.rtsp_url || '';
+        });
+        actions.append(useMain, useSub);
+        card.append(info, actions);
+        profBox.appendChild(card);
+      }
+    }
+
+    updateCameraFormVisibility();
+    const parts = [
+      [data.manufacturer, data.model].filter(Boolean).join(' ') || 'Detected',
+      data.pull_point_supported === true ? 'PullPoint supported' : (data.pull_point_supported === false ? 'Pixel fallback' : ''),
+      data.ptz_enabled ? `PTZ (${data.ptz_type || 'onvif'})` : 'No PTZ',
+    ].filter(Boolean);
+    status.textContent = parts.join(' · ');
+  } catch (err) {
+    status.textContent = `Auto-Detect error: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function testCameraStream(streamKind) {
+  const input = streamKind === 'sub' ? qs('#cam-sub-rtsp') : qs('#cam-main-rtsp');
+  const rtspURL = input?.value.trim() || '';
+  const box = qs('#cam-test-preview');
+  const img = qs('#cam-test-img');
+  const meta = qs('#cam-test-meta');
+  const msg = qs('#cam-test-msg');
+
+  box.classList.remove('hidden');
+  img.classList.add('hidden');
+  img.removeAttribute('src');
+
+  if (!rtspURL) {
+    meta.textContent = `${streamKind.toUpperCase()} Stream`;
+    msg.textContent = `Enter a ${streamKind} RTSP URL first.`;
+    return;
+  }
+
+  meta.textContent = `Testing ${streamKind.toUpperCase()} stream via go2rtc...`;
+  msg.textContent = '';
+
+  const btnMain = qs('#btn-cam-test-main');
+  const btnSub = qs('#btn-cam-test-sub');
+  if (btnMain) btnMain.disabled = true;
+  if (btnSub) btnSub.disabled = true;
+
+  try {
+    const res = await fetch('/api/cameras/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rtsp_url: rtspURL,
+        username: qs('#cam-user').value.trim(),
+        password: qs('#cam-pass').value,
+        camera_id: state.cameraDialog.mode === 'edit' ? state.cameraDialog.id : '',
+        stream_kind: streamKind,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.ok) {
+      if (data.snapshot_b64) {
+        img.src = `data:image/jpeg;base64,${data.snapshot_b64}`;
+        img.classList.remove('hidden');
+      }
+      const dims = data.width && data.height ? `${data.width}x${data.height}` : 'Dimensions unknown';
+      meta.textContent = `${streamKind.toUpperCase()} OK · ${dims} · ${data.codec || 'unknown'} · ${data.latency_ms} ms`;
+      msg.textContent = data.error || '';
+      if (streamKind === 'main' && data.width && data.height && !qs('#cam-resolution').value.trim()) {
+        qs('#cam-resolution').value = `${data.width}x${data.height}`;
+      }
+    } else {
+      meta.textContent = `${streamKind.toUpperCase()} Test Failed`;
+      msg.textContent = data.error || `HTTP ${res.status}`;
+    }
+  } catch (err) {
+    meta.textContent = `${streamKind.toUpperCase()} Test Error`;
+    msg.textContent = err.message;
+  } finally {
+    if (btnMain) btnMain.disabled = false;
+    if (btnSub) btnSub.disabled = false;
+  }
+}
+
+qs('#btn-cam-test-main')?.addEventListener('click', () => testCameraStream('main'));
+qs('#btn-cam-test-sub')?.addEventListener('click', () => testCameraStream('sub'));
+
+qs('#btn-cam-delete')?.addEventListener('click', async () => {
+  if (state.cameraDialog.mode === 'edit' && state.cameraDialog.id) {
+    await deleteCameraByID(state.cameraDialog.id);
+  }
+});
+
+qs('#cam-dlg-form')?.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const errEl = qs('#cam-dlg-error');
+  const saveBtn = qs('#btn-cam-save');
+  errEl.textContent = '';
+
+  const isEdit = state.cameraDialog.mode === 'edit';
+  const optInt = (el) => {
+    const s = el?.value.trim() || '';
+    if (s === '') return null;
+    const n = Number(s);
+    return Number.isFinite(n) ? Math.trunc(n) : null;
+  };
+  const intOr = (el, def) => {
+    const n = Number(el?.value);
+    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : def;
+  };
+
+  const payload = {
+    id: isEdit ? state.cameraDialog.id : qs('#cam-id').value.trim(),
+    name: qs('#cam-name').value.trim(),
+    enabled: Boolean(qs('#cam-enabled').checked),
+    main_rtsp: qs('#cam-main-rtsp').value.trim(),
+    sub_rtsp: qs('#cam-sub-rtsp').value.trim(),
+    username: qs('#cam-user').value.trim(),
+    password: qs('#cam-pass').value,
+    live_stream: qs('#cam-live-stream').value || 'sub',
+    resolution: qs('#cam-resolution').value.trim(),
+    aspect_ratio: qs('#cam-aspect-ratio').value || '',
+    pre_record_sec: optInt(qs('#cam-pre-rec')),
+    post_record_sec: optInt(qs('#cam-post-rec')),
+    max_clip_sec: optInt(qs('#cam-max-clip')),
+    motion: {
+      mode: qs('#cam-motion-mode').value || 'pixel',
+      onvif_url: qs('#cam-motion-onvif-url').value.trim(),
+      username: qs('#cam-motion-user').value.trim(),
+      password: qs('#cam-motion-pass').value,
+      keep_password: isEdit && qs('#cam-motion-pass').value === '',
+      dvr: qs('#cam-motion-dvr').value || '',
+      channel: Number(qs('#cam-motion-channel').value) || 0,
+      fps: intOr(qs('#cam-motion-fps'), 3),
+      width: intOr(qs('#cam-motion-width'), 320),
+      height: intOr(qs('#cam-motion-height'), 180),
+      threshold: intOr(qs('#cam-motion-threshold'), 25),
+      min_area_percent: Number(qs('#cam-motion-min-area').value) || 1.2,
+      max_area_percent: Number(qs('#cam-motion-max-area').value) || 85,
+      min_frames: intOr(qs('#cam-motion-min-frames'), 2),
+      ignore_zones: state.cameraDialog.ignoreZones,
+    },
+    ptz: {
+      enabled: Boolean(qs('#cam-ptz-enabled').checked),
+      type: qs('#cam-ptz-type').value || 'onvif',
+      url: qs('#cam-ptz-url').value.trim(),
+      username: qs('#cam-ptz-user').value.trim(),
+      password: qs('#cam-ptz-pass').value,
+      keep_password: isEdit && qs('#cam-ptz-pass').value === '',
+      profile_token: qs('#cam-ptz-token').value.trim(),
+      channel: Number(qs('#cam-ptz-channel').value) || 0,
+    },
+  };
+
+  saveBtn.disabled = true;
+  try {
+    const url = isEdit
+      ? `/api/cameras/${encodeURIComponent(state.cameraDialog.id)}`
+      : '/api/cameras';
+    const res = await fetch(url, {
+      method: isEdit ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      errEl.textContent = data.error || `Save failed (HTTP ${res.status})`;
+      return;
+    }
+    closeCameraDialog();
+    pollStatus();
+  } catch (err) {
+    errEl.textContent = err.message;
+  } finally {
+    saveBtn.disabled = false;
   }
 });
 

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -99,6 +100,9 @@ type CameraConfig struct {
 	Enabled       *bool        `yaml:"enabled"`
 	MainRTSP      string       `yaml:"main_rtsp"`
 	SubRTSP       string       `yaml:"sub_rtsp"`
+	LiveStream    string       `yaml:"live_stream,omitempty"`
+	Resolution    string       `yaml:"resolution,omitempty"`
+	AspectRatio   string       `yaml:"aspect_ratio,omitempty"`
 	PreRecordSec  *int         `yaml:"pre_record_sec"`
 	PostRecordSec *int         `yaml:"post_record_sec"`
 	MaxClipSec    *int         `yaml:"max_clip_sec"`
@@ -153,7 +157,7 @@ func (c *Config) ApplyDefaults() {
 	}
 
 	if strings.TrimSpace(c.Go2RTC.Bin) == "" {
-		c.Go2RTC.Bin = filepath.FromSlash("bin/go2rtc.exe")
+		c.Go2RTC.Bin = DefaultGo2RTCBin()
 	}
 	if c.Go2RTC.APIPort == 0 {
 		c.Go2RTC.APIPort = 1984
@@ -223,6 +227,10 @@ func (c *Config) ApplyDefaults() {
 		if strings.TrimSpace(cam.Name) == "" {
 			cam.Name = cam.ID
 		}
+		cam.LiveStream = strings.ToLower(strings.TrimSpace(cam.LiveStream))
+		cam.Resolution = strings.TrimSpace(cam.Resolution)
+		cam.AspectRatio = strings.ToLower(strings.TrimSpace(cam.AspectRatio))
+
 		m := &cam.Motion
 		m.Mode = strings.ToLower(strings.TrimSpace(m.Mode))
 		if m.Mode == "" {
@@ -382,6 +390,17 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("camera %q ptz.url cannot be empty when ptz.enabled is true", cam.ID)
 			}
 		}
+
+		switch cam.LiveStream {
+		case "", "auto", "sub", "main":
+		default:
+			return fmt.Errorf("camera %q invalid live_stream %q (expected auto, sub, or main)", cam.ID, cam.LiveStream)
+		}
+		switch cam.AspectRatio {
+		case "", "auto", "16:9", "4:3", "fill":
+		default:
+			return fmt.Errorf("camera %q invalid aspect_ratio %q (expected auto, 16:9, 4:3, or fill)", cam.ID, cam.AspectRatio)
+		}
 	}
 
 	return nil
@@ -421,6 +440,14 @@ func (c CameraConfig) EffectiveSubRTSP() string {
 	return c.MainRTSP
 }
 
+// EffectiveLiveStream returns "main" when configured for main stream or when no sub_rtsp is set, else "sub".
+func (c CameraConfig) EffectiveLiveStream() string {
+	if strings.EqualFold(strings.TrimSpace(c.LiveStream), "main") || strings.TrimSpace(c.SubRTSP) == "" {
+		return "main"
+	}
+	return "sub"
+}
+
 // EffectivePreRecordSec returns the camera's pre-record seconds or the global default.
 func (c CameraConfig) EffectivePreRecordSec(def RecordingConfig) int {
 	if c.PreRecordSec != nil {
@@ -445,22 +472,106 @@ func (c CameraConfig) EffectiveMaxClipSec(def RecordingConfig) int {
 	return def.MaxClipSec
 }
 
-// DetectFFmpeg locates ffmpeg on PATH or in standard Windows install directories.
+// DefaultGo2RTCBin returns the default bundled go2rtc executable path for the current OS.
+func DefaultGo2RTCBin() string {
+	if runtime.GOOS == "windows" {
+		return filepath.FromSlash("bin/go2rtc.exe")
+	}
+	return filepath.FromSlash("bin/go2rtc")
+}
+
+// DetectFFmpeg locates ffmpeg in bundled bin/, on PATH, or in standard OS install directories.
 func DetectFFmpeg() string {
+	exeName := "ffmpeg"
+	if runtime.GOOS == "windows" {
+		exeName = "ffmpeg.exe"
+	}
+
+	localCandidates := []string{filepath.Join("bin", exeName)}
+	if exe, err := os.Executable(); err == nil {
+		localCandidates = append(localCandidates, filepath.Join(filepath.Dir(exe), "bin", exeName))
+	}
+	for _, c := range localCandidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+
 	if p, err := exec.LookPath("ffmpeg"); err == nil {
 		return p
 	}
-	candidates := []string{
-		`C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe`,
-		`C:\Program Files\ffmpeg\bin\ffmpeg.exe`,
-		`C:\ffmpeg\bin\ffmpeg.exe`,
+
+	var sysCandidates []string
+	if runtime.GOOS == "windows" {
+		sysCandidates = []string{
+			`C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe`,
+			`C:\Program Files\ffmpeg\bin\ffmpeg.exe`,
+			`C:\ffmpeg\bin\ffmpeg.exe`,
+		}
+	} else {
+		sysCandidates = []string{
+			"/opt/homebrew/bin/ffmpeg",
+			"/usr/local/bin/ffmpeg",
+			"/usr/bin/ffmpeg",
+		}
 	}
-	for _, c := range candidates {
+	for _, c := range sysCandidates {
 		if st, err := os.Stat(c); err == nil && !st.IsDir() {
 			return c
 		}
 	}
 	return ""
+}
+
+// EnsureDefaultConfig writes a starter config.yaml at path if it does not already exist.
+func EnsureDefaultConfig(path string) (bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat config %q: %w", path, err)
+	}
+
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return false, fmt.Errorf("create config directory %q: %w", dir, err)
+		}
+	}
+
+	starter := fmt.Sprintf(`# FeatherNVR Configuration (auto-generated on first run)
+# Add cameras anytime from the Web UI (+ Add Camera) or by editing this file.
+
+server:
+  listen: ":8080"
+
+go2rtc:
+  bin: "%s"
+  api_port: 1984
+  rtsp_port: 8554
+  webrtc_port: 8555
+  config_path: "data/go2rtc.runtime.yaml"
+
+storage:
+  dir: "recordings"
+  db_path: "data/feathernvr.db"
+  max_gb: 100
+  high_watermark_pct: 98
+  low_watermark_pct: 92
+  sweep_interval_sec: 300
+
+recording:
+  pre_record_sec: 5
+  post_record_sec: 10
+  max_clip_sec: 300
+  max_buffer_mb: 24
+
+cameras: []
+`, filepath.ToSlash(DefaultGo2RTCBin()))
+
+	if err := os.WriteFile(path, []byte(starter), 0o600); err != nil {
+		return false, fmt.Errorf("write starter config %q: %w", path, err)
+	}
+	return true, nil
 }
 
 // SaveStorageCap updates storage.max_gb inside configPath while preserving
@@ -469,6 +580,49 @@ func SaveStorageCap(configPath string, maxGB float64) error {
 	if maxGB <= 0 {
 		return fmt.Errorf("storage.max_gb must be > 0, got %v", maxGB)
 	}
+	return updateConfigYAML(configPath, func(root *yaml.Node) error {
+		storageNode := findOrAddMappingKey(root, "storage", yaml.MappingNode)
+		if storageNode.Kind != yaml.MappingNode {
+			storageNode.Kind = yaml.MappingNode
+			storageNode.Content = nil
+		}
+
+		valStr := strconv.FormatFloat(maxGB, 'f', -1, 64)
+		tag := "!!int"
+		if strings.ContainsRune(valStr, '.') {
+			tag = "!!float"
+		}
+		maxNode := findOrAddMappingKey(storageNode, "max_gb", yaml.ScalarNode)
+		maxNode.Kind = yaml.ScalarNode
+		maxNode.Tag = tag
+		maxNode.Style = 0
+		maxNode.Value = valStr
+		return nil
+	})
+}
+
+// SaveCameras replaces the top-level cameras sequence inside configPath while preserving
+// existing comments, key ordering, and non-camera sections.
+func SaveCameras(configPath string, cameras []CameraConfig) error {
+	if cameras == nil {
+		cameras = []CameraConfig{}
+	}
+	return updateConfigYAML(configPath, func(root *yaml.Node) error {
+		var camDoc yaml.Node
+		if err := camDoc.Encode(cameras); err != nil {
+			return fmt.Errorf("encode cameras yaml: %w", err)
+		}
+		camNode := &camDoc
+		if camDoc.Kind == yaml.DocumentNode && len(camDoc.Content) > 0 {
+			camNode = camDoc.Content[0]
+		}
+		target := findOrAddMappingKey(root, "cameras", yaml.SequenceNode)
+		*target = *camNode
+		return nil
+	})
+}
+
+func updateConfigYAML(configPath string, fn func(root *yaml.Node) error) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("read config %q: %w", configPath, err)
@@ -489,22 +643,9 @@ func SaveStorageCap(configPath string, maxGB float64) error {
 		return fmt.Errorf("config root must be a YAML mapping")
 	}
 
-	storageNode := findOrAddMappingKey(root, "storage", yaml.MappingNode)
-	if storageNode.Kind != yaml.MappingNode {
-		storageNode.Kind = yaml.MappingNode
-		storageNode.Content = nil
+	if err := fn(root); err != nil {
+		return err
 	}
-
-	valStr := strconv.FormatFloat(maxGB, 'f', -1, 64)
-	tag := "!!int"
-	if strings.ContainsRune(valStr, '.') {
-		tag = "!!float"
-	}
-	maxNode := findOrAddMappingKey(storageNode, "max_gb", yaml.ScalarNode)
-	maxNode.Kind = yaml.ScalarNode
-	maxNode.Tag = tag
-	maxNode.Style = 0
-	maxNode.Value = valStr
 
 	var out bytes.Buffer
 	enc := yaml.NewEncoder(&out)

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -299,5 +300,148 @@ cameras:
 `
 	if _, err := Parse([]byte(missingURL)); err == nil || !strings.Contains(err.Error(), "ptz.url cannot be empty") {
 		t.Fatalf("expected missing ptz.url error, got %v", err)
+	}
+}
+
+func TestLiveStreamAspectRatioAndSaveCameras(t *testing.T) {
+	raw := `# Top comment stays
+storage:
+  dir: recordings
+  max_gb: 50
+
+cameras:
+  - id: cam1
+    name: Cam 1
+    main_rtsp: rtsp://127.0.0.1/main
+    sub_rtsp: rtsp://127.0.0.1/sub
+    live_stream: MAIN
+    aspect_ratio: Fill
+    resolution: 1920x1080
+    motion:
+      mode: pixel
+`
+	cfg, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse valid live_stream/aspect_ratio: %v", err)
+	}
+	if cfg.Cameras[0].LiveStream != "main" || cfg.Cameras[0].EffectiveLiveStream() != "main" {
+		t.Fatalf("expected effective live_stream main, got %q / %q", cfg.Cameras[0].LiveStream, cfg.Cameras[0].EffectiveLiveStream())
+	}
+	if cfg.Cameras[0].AspectRatio != "fill" {
+		t.Fatalf("expected aspect_ratio fill, got %q", cfg.Cameras[0].AspectRatio)
+	}
+
+	camNoSub := CameraConfig{ID: "c2", MainRTSP: "rtsp://127.0.0.1/m", LiveStream: "sub"}
+	if camNoSub.EffectiveLiveStream() != "main" {
+		t.Fatalf("expected fallback to main when sub_rtsp empty, got %q", camNoSub.EffectiveLiveStream())
+	}
+
+	badLive := `
+cameras:
+  - id: cam1
+    main_rtsp: rtsp://127.0.0.1/main
+    live_stream: ultra
+`
+	if _, err := Parse([]byte(badLive)); err == nil || !strings.Contains(err.Error(), "invalid live_stream") {
+		t.Fatalf("expected invalid live_stream error, got %v", err)
+	}
+
+	badAspect := `
+cameras:
+  - id: cam1
+    main_rtsp: rtsp://127.0.0.1/main
+    aspect_ratio: 21:9
+`
+	if _, err := Parse([]byte(badAspect)); err == nil || !strings.Contains(err.Error(), "invalid aspect_ratio") {
+		t.Fatalf("expected invalid aspect_ratio error, got %v", err)
+	}
+
+	tmpPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpPath, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	newCams := []CameraConfig{
+		cfg.Cameras[0],
+		{
+			ID:         "cam2",
+			Name:       "Cam 2",
+			MainRTSP:   "rtsp://127.0.0.1/main2",
+			SubRTSP:    "rtsp://127.0.0.1/sub2",
+			LiveStream: "sub",
+			Motion:     MotionConfig{Mode: MotionModePixel},
+		},
+	}
+	if err := SaveCameras(tmpPath, newCams); err != nil {
+		t.Fatalf("SaveCameras failed: %v", err)
+	}
+
+	savedBytes, err := os.ReadFile(tmpPath)
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	if !strings.Contains(string(savedBytes), "# Top comment stays") {
+		t.Fatalf("expected top comment preserved:\n%s", string(savedBytes))
+	}
+
+	reloaded, err := Load(tmpPath)
+	if err != nil {
+		t.Fatalf("reload saved config: %v", err)
+	}
+	if reloaded.Storage.MaxGB != 50 || len(reloaded.Cameras) != 2 || reloaded.Cameras[1].ID != "cam2" {
+		t.Fatalf("unexpected reloaded config: storage=%+v cameras=%+v", reloaded.Storage, reloaded.Cameras)
+	}
+}
+
+func TestEnsureDefaultConfigAndPlatformDefaults(t *testing.T) {
+	wantGo2RTC := filepath.FromSlash("bin/go2rtc")
+	if runtime.GOOS == "windows" {
+		wantGo2RTC = filepath.FromSlash("bin/go2rtc.exe")
+	}
+	if got := DefaultGo2RTCBin(); got != wantGo2RTC {
+		t.Fatalf("DefaultGo2RTCBin()=%q, want %q", got, wantGo2RTC)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "nested", "config.yaml")
+	created, err := EnsureDefaultConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("EnsureDefaultConfig failed: %v", err)
+	}
+	if !created {
+		t.Fatalf("expected created=true on first call")
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load starter config failed: %v", err)
+	}
+	if len(cfg.Cameras) != 0 || cfg.Server.Listen != ":8080" || filepath.FromSlash(cfg.Go2RTC.Bin) != wantGo2RTC {
+		t.Fatalf("unexpected loaded starter config: %+v", cfg)
+	}
+
+	if err := os.WriteFile(cfgPath, []byte("server:\n  listen: \":9999\"\n"), 0o600); err != nil {
+		t.Fatalf("overwrite sentinel: %v", err)
+	}
+	createdAgain, err := EnsureDefaultConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("EnsureDefaultConfig second call failed: %v", err)
+	}
+	if createdAgain {
+		t.Fatalf("expected created=false when config already exists")
+	}
+	reloaded, err := Load(cfgPath)
+	if err != nil || reloaded.Server.Listen != ":9999" {
+		t.Fatalf("expected existing file preserved, got %+v err=%v", reloaded, err)
+	}
+
+	if err := SaveCameras(cfgPath, []CameraConfig{{
+		ID:       "starter_cam",
+		Name:     "Starter Cam",
+		MainRTSP: "rtsp://127.0.0.1/main",
+	}}); err != nil {
+		t.Fatalf("SaveCameras on starter config failed: %v", err)
+	}
+	withCam, err := Load(cfgPath)
+	if err != nil || len(withCam.Cameras) != 1 || withCam.Cameras[0].ID != "starter_cam" {
+		t.Fatalf("unexpected cameras after SaveCameras: %+v err=%v", withCam, err)
 	}
 }

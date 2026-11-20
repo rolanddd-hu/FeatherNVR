@@ -1,6 +1,15 @@
 package go2rtc
 
 import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"sync"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -137,4 +146,102 @@ func TestRenderConfigYAML(t *testing.T) {
 	if got := mgr.FrameJPEGURL("ptz1_sub"); got != "http://127.0.0.1:11984/api/frame.jpeg?src=ptz1_sub" {
 		t.Fatalf("FrameJPEGURL = %q", got)
 	}
+}
+
+func makeTestBox(typ string, payload []byte) []byte {
+	b := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint32(b[0:4], uint32(len(b)))
+	copy(b[4:8], typ)
+	copy(b[8:], payload)
+	return b
+}
+
+func makeTestFullBox(typ string, version byte, flags uint32, body []byte) []byte {
+	p := make([]byte, 4+len(body))
+	p[0] = version
+	copy(p[4:], body)
+	return makeTestBox(typ, p)
+}
+
+func buildProbeInitBytes() []byte {
+	ftyp := makeTestBox("ftyp", []byte("iso5\x00\x00\x02\x00iso5iso6"))
+	tkhdBody := make([]byte, 80)
+	binary.BigEndian.PutUint32(tkhdBody[8:12], 1)
+	tkhd := makeTestFullBox("tkhd", 0, 3, tkhdBody)
+	mdhdBody := make([]byte, 20)
+	binary.BigEndian.PutUint32(mdhdBody[8:12], 90000)
+	mdhd := makeTestFullBox("mdhd", 0, 0, mdhdBody)
+	hdlrBody := make([]byte, 12)
+	copy(hdlrBody[4:8], "vide")
+	hdlr := makeTestFullBox("hdlr", 0, 0, hdlrBody)
+	entry := make([]byte, 78)
+	binary.BigEndian.PutUint16(entry[24:26], 1920)
+	binary.BigEndian.PutUint16(entry[26:28], 1080)
+	hev1 := makeTestBox("hvc1", entry)
+	stsdBody := make([]byte, 4+len(hev1))
+	binary.BigEndian.PutUint32(stsdBody[0:4], 1)
+	copy(stsdBody[4:], hev1)
+	stsd := makeTestFullBox("stsd", 0, 0, stsdBody)
+	minf := makeTestBox("minf", makeTestBox("stbl", stsd))
+	mdia := makeTestBox("mdia", append(append(mdhd, hdlr...), minf...))
+	moov := makeTestBox("moov", makeTestBox("trak", append(tkhd, mdia...)))
+	var buf bytes.Buffer
+	buf.Write(ftyp)
+	buf.Write(moov)
+	return buf.Bytes()
+}
+
+func TestUpsertDeleteAndTestStream(t *testing.T) {
+	var mu sync.Mutex
+	var upsertedName, upsertedSrc, deletedSrc string
+	initBytes := buildProbeInitBytes()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/streams" && r.Method == http.MethodPut:
+			mu.Lock()
+			upsertedName = r.URL.Query().Get("name")
+			upsertedSrc = r.URL.Query().Get("src")
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/streams" && r.Method == http.MethodDelete:
+			mu.Lock()
+			deletedSrc = r.URL.Query().Get("src")
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/stream.mp4":
+			w.Header().Set("Content-Type", "video/mp4")
+			_, _ = w.Write(initBytes)
+		case r.URL.Path == "/api/frame.jpeg":
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte("fakejpegdata"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	port, _ := strconv.Atoi(u.Port())
+	mgr := New(&config.Config{
+		Go2RTC: config.Go2RTCConfig{APIPort: port},
+	}, nil, nil)
+
+	res, err := mgr.TestStream(context.Background(), "rtsp://127.0.0.1:554/stream1")
+	if err != nil {
+		t.Fatalf("TestStream unexpected err: %v", err)
+	}
+	if !res.OK || res.Width != 1920 || res.Height != 1080 || res.Codec != "H.265" || res.SnapshotB64 == "" {
+		t.Fatalf("unexpected TestStream result: %+v", res)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if upsertedName == "" || upsertedSrc != "rtsp://127.0.0.1:554/stream1#backchannel=0" {
+		t.Fatalf("unexpected upsert call: name=%q src=%q", upsertedName, upsertedSrc)
+	}
+	if deletedSrc != upsertedName {
+		t.Fatalf("expected temp probe %q to be deleted, deletedSrc=%q", upsertedName, deletedSrc)
+	}
+	_ = io.Discard
 }

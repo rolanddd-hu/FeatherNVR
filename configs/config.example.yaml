@@ -1,6 +1,7 @@
 # FeatherNVR Configuration Example
-# Copy this file to config.yaml in the project root and edit with your camera details.
-# Tip: Run `.\feathernvr.exe -discover` to find ONVIF URLs for your Hikvision PTZ & Keview cameras.
+# FeatherNVR automatically generates a starter config.yaml on first run if none exists.
+# You can also copy this file to config.yaml to configure DVR/ONVIF cameras upfront.
+# Tip: Run `.\feathernvr.exe -discover` (or `./feathernvr -discover`) to find ONVIF URLs.
 
 server:
   listen: ":8080"
@@ -9,7 +10,8 @@ server:
   # password: "change-me"
 
 go2rtc:
-  bin: "bin/go2rtc.exe"
+  # Optional override; defaults automatically to bin/go2rtc.exe (Windows) or bin/go2rtc (Linux/macOS).
+  # bin: "bin/go2rtc.exe"
   api_port: 1984
   rtsp_port: 8554
   webrtc_port: 8555

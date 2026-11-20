@@ -32,6 +32,13 @@ type CameraStatus struct {
 	StreamMain   string    `json:"stream_main"`
 	BitrateKbps  float64   `json:"bitrate_kbps"`
 	FPS          float64   `json:"fps"`
+	Width        int       `json:"width,omitempty"`
+	Height       int       `json:"height,omitempty"`
+	Codec        string    `json:"codec,omitempty"`
+	LiveStream   string    `json:"live_stream"`
+	AspectRatio  string    `json:"aspect_ratio,omitempty"`
+	Resolution   string    `json:"resolution,omitempty"`
+	ConfigRev    uint64    `json:"config_rev"`
 	MotionMode   string    `json:"motion_mode"`
 	MotionActive bool      `json:"motion_active"`
 	MotionScore  float64   `json:"motion_score"`
@@ -83,6 +90,7 @@ type CameraRecorder struct {
 	clipThumbRel     string
 	clipSource       string
 	rebaser          *fmp4.ClipRebaser
+	configRev        uint64
 	cooldownGen      uint64
 	cooldownTimer    *time.Timer
 }
@@ -759,6 +767,13 @@ func (r *CameraRecorder) spawnThumbnailCapture(clipAbs, clipRel string) {
 	}()
 }
 
+// SetConfigRev updates the camera configuration revision included in /api/status snapshots.
+func (r *CameraRecorder) SetConfigRev(rev uint64) {
+	r.mu.Lock()
+	r.configRev = rev
+	r.mu.Unlock()
+}
+
 // Status returns a sanitized live snapshot of this camera's recorder and motion state.
 func (r *CameraRecorder) Status() CameraStatus {
 	r.mu.Lock()
@@ -771,10 +786,19 @@ func (r *CameraRecorder) Status() CameraStatus {
 		StreamMain:  r.cam.ID + "_main",
 		BitrateKbps: r.bitrateKbps,
 		FPS:         r.fps,
+		LiveStream:  r.cam.EffectiveLiveStream(),
+		AspectRatio: r.cam.AspectRatio,
+		Resolution:  r.cam.Resolution,
+		ConfigRev:   r.configRev,
 		MotionMode:  r.cam.Motion.Mode,
 		PTZEnabled:  r.cam.PTZ.Enabled,
 		Reconnects:  r.reconnects,
 		LastError:   r.lastError,
+	}
+	if r.initInfo != nil {
+		st.Width = int(r.initInfo.Width)
+		st.Height = int(r.initInfo.Height)
+		st.Codec = r.initInfo.Codec
 	}
 	det := r.detector
 	r.mu.Unlock()
@@ -814,6 +838,20 @@ func (m *Manager) Register(rec *CameraRecorder) {
 		m.order = append(m.order, rec.cam.ID)
 	}
 	m.recorders[rec.cam.ID] = rec
+}
+
+// Remove unregisters camID from the recorder manager.
+func (m *Manager) Remove(camID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.recorders, camID)
+	filtered := m.order[:0]
+	for _, id := range m.order {
+		if id != camID {
+			filtered = append(filtered, id)
+		}
+	}
+	m.order = filtered
 }
 
 // Get returns the CameraRecorder for camID.

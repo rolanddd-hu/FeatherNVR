@@ -31,6 +31,11 @@ func buildTestInit() (ftyp []byte, moov []byte) {
 	buildTrak := func(trackID uint32, handler string, timescale uint32) []byte {
 		tkhdBody := make([]byte, 80)
 		binary.BigEndian.PutUint32(tkhdBody[8:12], trackID)
+		if handler == "vide" {
+			// tkhdBody starts after 4-byte FullBox header -> tkhd width at offset 76-4=72, height at 80-4=76.
+			binary.BigEndian.PutUint16(tkhdBody[72:74], 1280)
+			binary.BigEndian.PutUint16(tkhdBody[76:78], 720)
+		}
 		tkhd := makeFullBox("tkhd", 0, 3, tkhdBody)
 
 		mdhdBody := make([]byte, 20)
@@ -41,7 +46,22 @@ func buildTestInit() (ftyp []byte, moov []byte) {
 		copy(hdlrBody[4:8], handler)
 		hdlr := makeFullBox("hdlr", 0, 0, hdlrBody)
 
-		mdia := makeBox("mdia", append(mdhd, hdlr...))
+		mdiaChildren := append(mdhd, hdlr...)
+		if handler == "vide" {
+			sampleEntry := make([]byte, 78)
+			binary.BigEndian.PutUint16(sampleEntry[24:26], 1920)
+			binary.BigEndian.PutUint16(sampleEntry[26:28], 1080)
+			avc1 := makeBox("avc1", sampleEntry)
+			stsdBody := make([]byte, 4+len(avc1))
+			binary.BigEndian.PutUint32(stsdBody[0:4], 1)
+			copy(stsdBody[4:], avc1)
+			stsd := makeFullBox("stsd", 0, 0, stsdBody)
+			stbl := makeBox("stbl", stsd)
+			minf := makeBox("minf", stbl)
+			mdiaChildren = append(mdiaChildren, minf...)
+		}
+
+		mdia := makeBox("mdia", mdiaChildren)
 		return makeBox("trak", append(tkhd, mdia...))
 	}
 
@@ -120,6 +140,9 @@ func TestReadBoxParseInitAndMoof(t *testing.T) {
 	}
 	if init.VideoTrackID != 1 {
 		t.Fatalf("expected VideoTrackID=1, got %d", init.VideoTrackID)
+	}
+	if init.Width != 1920 || init.Height != 1080 || init.Codec != "H.264" {
+		t.Fatalf("expected 1920x1080 H.264, got %dx%d %q", init.Width, init.Height, init.Codec)
 	}
 	if init.Timescales[1] != 90000 || init.Timescales[2] != 48000 {
 		t.Fatalf("unexpected timescales: %+v", init.Timescales)

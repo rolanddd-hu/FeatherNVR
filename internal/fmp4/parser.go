@@ -21,6 +21,9 @@ type InitInfo struct {
 	Raw          []byte
 	VideoTrackID uint32
 	Timescales   map[uint32]uint32
+	Width        uint32
+	Height       uint32
+	Codec        string
 }
 
 // Fragment represents a single moof + mdat media fragment.
@@ -173,9 +176,16 @@ func ParseInit(ftyp, moov []byte) (*InitInfo, error) {
 		if cb.typ != "trak" {
 			return nil
 		}
-		var trackID uint32
-		var timescale uint32
-		var handler string
+		var (
+			trackID    uint32
+			timescale  uint32
+			handler    string
+			tkhdW      uint32
+			tkhdH      uint32
+			stsdW      uint32
+			stsdH      uint32
+			sampleType string
+		)
 
 		if err := iterBoxes(moov, cb.payload, cb.end, func(tc childBox) error {
 			switch tc.typ {
@@ -189,9 +199,17 @@ func ParseInit(ftyp, moov []byte) (*InitInfo, error) {
 					if len(p) >= 16 {
 						trackID = binary.BigEndian.Uint32(p[12:16])
 					}
+					if len(p) >= 84 {
+						tkhdW = uint32(binary.BigEndian.Uint16(p[76:78]))
+						tkhdH = uint32(binary.BigEndian.Uint16(p[80:82]))
+					}
 				case 1:
 					if len(p) >= 24 {
 						trackID = binary.BigEndian.Uint32(p[20:24])
+					}
+					if len(p) >= 96 {
+						tkhdW = uint32(binary.BigEndian.Uint16(p[88:90]))
+						tkhdH = uint32(binary.BigEndian.Uint16(p[92:94]))
 					}
 				}
 			case "mdia":
@@ -217,6 +235,28 @@ func ParseInit(ftyp, moov []byte) (*InitInfo, error) {
 						if len(p) >= 12 {
 							handler = string(p[8:12])
 						}
+					case "minf":
+						return iterBoxes(moov, mc.payload, mc.end, func(mfc childBox) error {
+							if mfc.typ != "stbl" {
+								return nil
+							}
+							return iterBoxes(moov, mfc.payload, mfc.end, func(sc childBox) error {
+								if sc.typ != "stsd" || sc.end-sc.payload < 8 {
+									return nil
+								}
+								return iterBoxes(moov, sc.payload+8, sc.end, func(entry childBox) error {
+									if sampleType == "" {
+										sampleType = entry.typ
+										ep := moov[entry.payload:entry.end]
+										if len(ep) >= 28 {
+											stsdW = uint32(binary.BigEndian.Uint16(ep[24:26]))
+											stsdH = uint32(binary.BigEndian.Uint16(ep[26:28]))
+										}
+									}
+									return nil
+								})
+							})
+						})
 					}
 					return nil
 				})
@@ -233,6 +273,14 @@ func ParseInit(ftyp, moov []byte) (*InitInfo, error) {
 			info.Timescales[trackID] = timescale
 			if handler == "vide" && info.VideoTrackID == 0 {
 				info.VideoTrackID = trackID
+				if stsdW > 0 && stsdH > 0 {
+					info.Width = stsdW
+					info.Height = stsdH
+				} else if tkhdW > 0 && tkhdH > 0 {
+					info.Width = tkhdW
+					info.Height = tkhdH
+				}
+				info.Codec = mapSampleEntryCodec(sampleType)
 			}
 		}
 		return nil
@@ -242,6 +290,23 @@ func ParseInit(ftyp, moov []byte) (*InitInfo, error) {
 	}
 
 	return info, nil
+}
+
+func mapSampleEntryCodec(fourCC string) string {
+	switch fourCC {
+	case "avc1", "avc3":
+		return "H.264"
+	case "hev1", "hvc1":
+		return "H.265"
+	case "mp4v":
+		return "MPEG-4"
+	case "vp09":
+		return "VP9"
+	case "av01":
+		return "AV1"
+	default:
+		return fourCC
+	}
 }
 
 // ParseMoof parses metadata from a moof box using track info from InitInfo.

@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"feathernvr/internal/config"
+	"feathernvr/internal/go2rtc"
+	"feathernvr/internal/motion"
 	"feathernvr/internal/ptz"
 	"feathernvr/internal/recorder"
 	"feathernvr/internal/storage"
@@ -537,6 +539,267 @@ func TestLayoutSettingsEndpoint(t *testing.T) {
 	srv.Handler().ServeHTTP(rrBad, httptest.NewRequest(http.MethodPut, "/api/settings/layout", strings.NewReader(`{not json`)))
 	if rrBad.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 on bad json, got %d", rrBad.Code)
+	}
+}
+
+type mockCameraController struct {
+	mu          sync.Mutex
+	cameras     []config.CameraConfig
+	dvrs        []config.HikvisionDVRConfig
+	lastTestURL string
+	lastProbe   motion.ProbeRequest
+}
+
+func (m *mockCameraController) ListCameras() []config.CameraConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]config.CameraConfig, len(m.cameras))
+	copy(out, m.cameras)
+	return out
+}
+
+func (m *mockCameraController) GetCamera(id string) (config.CameraConfig, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.cameras {
+		if c.ID == id {
+			return c, true
+		}
+	}
+	return config.CameraConfig{}, false
+}
+
+func (m *mockCameraController) ListDVRs() []config.HikvisionDVRConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]config.HikvisionDVRConfig, len(m.dvrs))
+	copy(out, m.dvrs)
+	return out
+}
+
+func (m *mockCameraController) AddCamera(ctx context.Context, cam config.CameraConfig) (config.CameraConfig, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cameras = append(m.cameras, cam)
+	return cam, nil
+}
+
+func (m *mockCameraController) UpdateCamera(ctx context.Context, cam config.CameraConfig) (config.CameraConfig, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.cameras {
+		if m.cameras[i].ID == cam.ID {
+			m.cameras[i] = cam
+			return cam, nil
+		}
+	}
+	return config.CameraConfig{}, os.ErrNotExist
+}
+
+func (m *mockCameraController) DeleteCamera(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.cameras {
+		if m.cameras[i].ID == id {
+			m.cameras = append(m.cameras[:i], m.cameras[i+1:]...)
+			return nil
+		}
+	}
+	return os.ErrNotExist
+}
+
+func (m *mockCameraController) TestStream(ctx context.Context, rawURL string) (*go2rtc.StreamTestResult, error) {
+	m.mu.Lock()
+	m.lastTestURL = rawURL
+	m.mu.Unlock()
+	return &go2rtc.StreamTestResult{
+		OK:        true,
+		LatencyMS: 42,
+		Width:     1920,
+		Height:    1080,
+		Codec:     "h264",
+	}, nil
+}
+
+func (m *mockCameraController) ProbeCamera(ctx context.Context, req motion.ProbeRequest) (*motion.ProbeResult, error) {
+	m.mu.Lock()
+	m.lastProbe = req
+	m.mu.Unlock()
+	return &motion.ProbeResult{
+		Name:                "Acme CamPro",
+		Manufacturer:        "Acme",
+		Model:               "CamPro",
+		ONVIFURL:            "http://" + req.Host + "/onvif/device_service",
+		SuggestedMotionMode: config.MotionModeONVIF,
+		MainRTSP:            "rtsp://" + req.Host + "/main",
+		SubRTSP:             "rtsp://" + req.Host + "/sub",
+		PTZEnabled:          true,
+		PTZType:             "onvif",
+		PTZURL:              "http://" + req.Host + "/onvif/ptz_service",
+		PTZProfileToken:     "prof1",
+		Profiles: []motion.ProbeProfile{
+			{Name: "Main", Token: "prof1", Width: 1920, Height: 1080, Codec: "H264", FPS: 25, RTSPURL: "rtsp://" + req.Host + "/main"},
+			{Name: "Sub", Token: "prof2", Width: 640, Height: 360, Codec: "H264", FPS: 15, RTSPURL: "rtsp://" + req.Host + "/sub"},
+		},
+	}, nil
+}
+
+func TestCameraCRUDProbeTestAndRedaction(t *testing.T) {
+	srv, _, _ := setupTestServer(t, "", "", nil)
+	enabledTrue := true
+	mock := &mockCameraController{
+		cameras: []config.CameraConfig{
+			{
+				ID:         "existing_cam",
+				Name:       "Existing",
+				Enabled:    &enabledTrue,
+				MainRTSP:   "rtsp://admin:TOP_SECRET_RTSP@192.168.1.10/stream1",
+				SubRTSP:    "rtsp://admin:TOP_SECRET_RTSP@192.168.1.10/stream2",
+				LiveStream: "sub",
+				Motion: config.MotionConfig{
+					Mode:     config.MotionModeONVIF,
+					ONVIFURL: "http://192.168.1.10/onvif/device_service",
+					Username: "admin",
+					Password: "TOP_SECRET_ONVIF",
+				},
+				PTZ: config.PTZConfig{
+					Enabled:      true,
+					Type:         "onvif",
+					URL:          "http://192.168.1.10/onvif/device_service",
+					Username:     "admin",
+					Password:     "TOP_SECRET_PTZ",
+					ProfileToken: "p1",
+				},
+			},
+		},
+		dvrs: []config.HikvisionDVRConfig{{ID: "dvr1", Host: "192.168.1.200", Port: 80}},
+	}
+	srv.SetCameraController(mock)
+
+	// 1. GET /api/cameras and GET /api/cameras/{id} must redact passwords
+	rrList := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrList, httptest.NewRequest(http.MethodGet, "/api/cameras", nil))
+	if rrList.Code != http.StatusOK {
+		t.Fatalf("GET /api/cameras status=%d body=%s", rrList.Code, rrList.Body.String())
+	}
+	if strings.Contains(rrList.Body.String(), "TOP_SECRET") {
+		t.Fatalf("plaintext password leaked in GET /api/cameras: %s", rrList.Body.String())
+	}
+	if !strings.Contains(rrList.Body.String(), "********") {
+		t.Fatalf("expected redacted password marker in GET /api/cameras: %s", rrList.Body.String())
+	}
+
+	rrGet := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrGet, httptest.NewRequest(http.MethodGet, "/api/cameras/existing_cam", nil))
+	if rrGet.Code != http.StatusOK {
+		t.Fatalf("GET /api/cameras/existing_cam status=%d body=%s", rrGet.Code, rrGet.Body.String())
+	}
+	if strings.Contains(rrGet.Body.String(), "TOP_SECRET") {
+		t.Fatalf("plaintext password leaked in GET /api/cameras/{id}: %s", rrGet.Body.String())
+	}
+
+	// 2. PUT preserving existing RTSP/Motion/PTZ passwords when ******** / blank is sent
+	putPayload := `{
+		"name": "Existing Renamed",
+		"main_rtsp": "rtsp://admin:********@192.168.1.10/stream1",
+		"sub_rtsp": "rtsp://admin:********@192.168.1.10/stream2",
+		"username": "admin",
+		"password": "",
+		"live_stream": "main",
+		"aspect_ratio": "fill",
+		"resolution": "1920x1080",
+		"motion": {"mode": "onvif", "onvif_url": "http://192.168.1.10/onvif/device_service", "username": "admin", "password": "", "keep_password": true},
+		"ptz": {"enabled": true, "type": "onvif", "url": "http://192.168.1.10/onvif/device_service", "username": "admin", "password": "", "keep_password": true, "profile_token": "p1"}
+	}`
+	rrPut := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrPut, httptest.NewRequest(http.MethodPut, "/api/cameras/existing_cam", strings.NewReader(putPayload)))
+	if rrPut.Code != http.StatusOK {
+		t.Fatalf("PUT /api/cameras/existing_cam status=%d body=%s", rrPut.Code, rrPut.Body.String())
+	}
+	updated, ok := mock.GetCamera("existing_cam")
+	if !ok {
+		t.Fatalf("expected existing_cam in controller")
+	}
+	if updated.MainRTSP != "rtsp://admin:TOP_SECRET_RTSP@192.168.1.10/stream1" ||
+		updated.SubRTSP != "rtsp://admin:TOP_SECRET_RTSP@192.168.1.10/stream2" {
+		t.Fatalf("expected RTSP password preserved, got main=%q sub=%q", updated.MainRTSP, updated.SubRTSP)
+	}
+	if updated.Motion.Password != "TOP_SECRET_ONVIF" || updated.PTZ.Password != "TOP_SECRET_PTZ" {
+		t.Fatalf("expected Motion/PTZ passwords preserved, got motion=%q ptz=%q", updated.Motion.Password, updated.PTZ.Password)
+	}
+	if updated.LiveStream != "main" || updated.AspectRatio != "fill" || updated.Resolution != "1920x1080" {
+		t.Fatalf("expected updated display settings, got %+v", updated)
+	}
+
+	// 3. POST /api/cameras/test resolves ******** to stored password
+	testPayload := `{"camera_id":"existing_cam","stream_kind":"main","rtsp_url":"rtsp://admin:********@192.168.1.10/stream1","username":"admin","password":""}`
+	rrTest := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrTest, httptest.NewRequest(http.MethodPost, "/api/cameras/test", strings.NewReader(testPayload)))
+	if rrTest.Code != http.StatusOK {
+		t.Fatalf("POST /api/cameras/test status=%d body=%s", rrTest.Code, rrTest.Body.String())
+	}
+	if mock.lastTestURL != "rtsp://admin:TOP_SECRET_RTSP@192.168.1.10/stream1" {
+		t.Fatalf("expected resolved RTSP password in TestStream call, got %q", mock.lastTestURL)
+	}
+
+	// 4. POST /api/cameras creates camera with auto-slug ID and credential injection
+	createPayload := `{
+		"name": "Back Yard Cam!",
+		"main_rtsp": "rtsp://192.168.1.55/stream1",
+		"sub_rtsp": "rtsp://192.168.1.55/stream2",
+		"username": "camuser",
+		"password": "NEW_CAM_PASS",
+		"live_stream": "sub",
+		"motion": {"mode": "pixel"},
+		"ptz": {"enabled": false}
+	}`
+	rrCreate := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrCreate, httptest.NewRequest(http.MethodPost, "/api/cameras", strings.NewReader(createPayload)))
+	if rrCreate.Code != http.StatusCreated {
+		t.Fatalf("POST /api/cameras status=%d body=%s", rrCreate.Code, rrCreate.Body.String())
+	}
+	if strings.Contains(rrCreate.Body.String(), "NEW_CAM_PASS") {
+		t.Fatalf("plaintext password leaked in POST /api/cameras response: %s", rrCreate.Body.String())
+	}
+	var createdDTO cameraDTO
+	if err := json.Unmarshal(rrCreate.Body.Bytes(), &createdDTO); err != nil {
+		t.Fatalf("unmarshal created DTO: %v", err)
+	}
+	if createdDTO.ID != "back_yard_cam" {
+		t.Fatalf("expected auto-slug id back_yard_cam, got %q", createdDTO.ID)
+	}
+	storedCreated, ok := mock.GetCamera("back_yard_cam")
+	if !ok {
+		t.Fatalf("created camera missing in controller")
+	}
+	if storedCreated.MainRTSP != "rtsp://camuser:NEW_CAM_PASS@192.168.1.55/stream1" {
+		t.Fatalf("expected injected credentials in stored MainRTSP, got %q", storedCreated.MainRTSP)
+	}
+
+	// 5. POST /api/cameras/probe forwards credentials and returns detected profiles
+	probePayload := `{"host":"192.168.1.55","port":80,"username":"camuser","password":"NEW_CAM_PASS"}`
+	rrProbe := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrProbe, httptest.NewRequest(http.MethodPost, "/api/cameras/probe", strings.NewReader(probePayload)))
+	if rrProbe.Code != http.StatusOK {
+		t.Fatalf("POST /api/cameras/probe status=%d body=%s", rrProbe.Code, rrProbe.Body.String())
+	}
+	if mock.lastProbe.Host != "192.168.1.55" || mock.lastProbe.Username != "camuser" || mock.lastProbe.Password != "NEW_CAM_PASS" {
+		t.Fatalf("unexpected probe request forwarded: %+v", mock.lastProbe)
+	}
+	if !strings.Contains(rrProbe.Body.String(), `"main_rtsp":"rtsp://192.168.1.55/main"`) {
+		t.Fatalf("unexpected probe response: %s", rrProbe.Body.String())
+	}
+
+	// 6. DELETE /api/cameras/{id} removes camera and subsequent GET returns 404
+	rrDel := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrDel, httptest.NewRequest(http.MethodDelete, "/api/cameras/back_yard_cam", nil))
+	if rrDel.Code != http.StatusOK {
+		t.Fatalf("DELETE /api/cameras/back_yard_cam status=%d body=%s", rrDel.Code, rrDel.Body.String())
+	}
+	rrAfter := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrAfter, httptest.NewRequest(http.MethodGet, "/api/cameras/back_yard_cam", nil))
+	if rrAfter.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after delete, got %d", rrAfter.Code)
 	}
 }
 

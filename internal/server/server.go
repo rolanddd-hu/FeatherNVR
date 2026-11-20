@@ -34,6 +34,7 @@ type Server struct {
 	db            *storage.DB
 	ptzMgr        *ptz.Manager
 	ptzTimers     ptzTimers
+	camCtrl       CameraController
 	retention     *storage.RetentionManager
 	recorders     *recorder.Manager
 	go2rtcBaseURL *url.URL
@@ -136,6 +137,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/recordings/days", s.handleListRecordingDays)
 	mux.HandleFunc("GET /api/recordings/day", s.handleGetRecordingDay)
 	mux.HandleFunc("DELETE /api/recordings/{id}", s.handleDeleteRecording)
+	mux.HandleFunc("GET /api/cameras", s.handleListCameras)
+	mux.HandleFunc("POST /api/cameras", s.handleCreateCamera)
+	mux.HandleFunc("POST /api/cameras/probe", s.handleProbeCamera)
+	mux.HandleFunc("POST /api/cameras/test", s.handleTestCamera)
+	mux.HandleFunc("GET /api/cameras/{id}", s.handleGetCamera)
+	mux.HandleFunc("PUT /api/cameras/{id}", s.handleUpdateCamera)
+	mux.HandleFunc("DELETE /api/cameras/{id}", s.handleDeleteCamera)
 	mux.HandleFunc("POST /api/cameras/{id}/trigger", s.handleTriggerCamera)
 	mux.HandleFunc("POST /api/cameras/{id}/ptz/move", s.handlePTZMove)
 	mux.HandleFunc("POST /api/cameras/{id}/ptz/stop", s.handlePTZStop)

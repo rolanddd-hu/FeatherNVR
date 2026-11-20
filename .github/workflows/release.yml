@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional version label for manual build dry-run (e.g. v0.1.0-rc1)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  GO2RTC_VERSION: v1.9.15
+
+jobs:
+  verify:
+    name: Verify Before Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check frontend JavaScript syntax
+        run: node --check internal/web/static/app.js
+
+      - name: Run go vet
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Run full test suite
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+
+  package:
+    name: Package (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+            archive: zip
+            go2rtc_asset: go2rtc_win64.zip
+            go2rtc_zip: true
+          - goos: windows
+            goarch: arm64
+            ext: ".exe"
+            archive: zip
+            go2rtc_asset: go2rtc_win_arm64.zip
+            go2rtc_zip: true
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+            go2rtc_asset: go2rtc_linux_amd64
+            go2rtc_zip: false
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+            go2rtc_asset: go2rtc_linux_arm64
+            go2rtc_zip: false
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+            go2rtc_asset: go2rtc_mac_amd64.zip
+            go2rtc_zip: true
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+            go2rtc_asset: go2rtc_mac_arm64.zip
+            go2rtc_zip: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine release version & package name
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"
+          fi
+          PKG_NAME="feathernvr_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          echo "RELEASE_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "PKG_NAME=${PKG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Build FeatherNVR & download bundled go2rtc
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/${PKG_NAME}"
+          mkdir -p "${STAGE}/bin" "${STAGE}/configs" "${STAGE}/scripts"
+
+          go build -trimpath \
+            -ldflags="-s -w -X main.version=${RELEASE_VERSION}" \
+            -o "${STAGE}/feathernvr${{ matrix.ext }}" \
+            ./cmd/feathernvr
+
+          GO2RTC_URL="https://github.com/AlexxIT/go2rtc/releases/download/${GO2RTC_VERSION}/${{ matrix.go2rtc_asset }}"
+          if [[ "${{ matrix.go2rtc_zip }}" == "true" ]]; then
+            curl -fsSL --retry 3 --retry-delay 2 -o go2rtc_dl.zip "${GO2RTC_URL}"
+            mkdir -p tmp_g2
+            unzip -q go2rtc_dl.zip -d tmp_g2
+            G2_FILE="$(find tmp_g2 -type f -name 'go2rtc*' | head -n 1)"
+            if [[ -z "${G2_FILE}" ]]; then
+              echo "Failed to locate go2rtc binary inside ${{ matrix.go2rtc_asset }}" >&2
+              exit 1
+            fi
+            cp "${G2_FILE}" "${STAGE}/bin/go2rtc${{ matrix.ext }}"
+            rm -rf tmp_g2 go2rtc_dl.zip
+          else
+            curl -fsSL --retry 3 --retry-delay 2 -o "${STAGE}/bin/go2rtc${{ matrix.ext }}" "${GO2RTC_URL}"
+          fi
+
+          if [[ "${{ matrix.goos }}" != "windows" ]]; then
+            chmod 0755 "${STAGE}/feathernvr${{ matrix.ext }}" "${STAGE}/bin/go2rtc${{ matrix.ext }}"
+            cp scripts/run.sh "${STAGE}/scripts/run.sh"
+            sed -i 's/\r$//' "${STAGE}/scripts/run.sh"
+            chmod 0755 "${STAGE}/scripts/run.sh"
+          else
+            cp scripts/*.ps1 "${STAGE}/scripts/"
+          fi
+
+          cp README.md "${STAGE}/README.md"
+          cp configs/config.example.yaml "${STAGE}/configs/config.example.yaml"
+
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            (cd dist && zip -qr "${PKG_NAME}.zip" "${PKG_NAME}")
+          else
+            tar -C dist -czf "dist/${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          fi
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ env.PKG_NAME }}.${{ matrix.archive }}
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd artifacts && sha256sum feathernvr_* > checksums.txt)
+          cat artifacts/checksums.txt
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            EXTRA_ARGS+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --title "FeatherNVR ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --notes $'## Out-of-the-Box Quick Start\n\nEach archive bundles **FeatherNVR** together with **go2rtc ('"${GO2RTC_VERSION}"$')** — no Go toolchain required:\n\n- **Windows**: Extract the `.zip` and run `feathernvr.exe` (or `.\\scripts\\run.ps1`).\n- **Linux / macOS**: Extract the `.tar.gz` and run `./feathernvr` (or `./scripts/run.sh`).\n\nOn first launch, FeatherNVR creates a starter `config.yaml` automatically. Open `http://localhost:8080` and click **+ Add Camera** to scan your LAN or configure streams.\n\n*(Install `ffmpeg` on `PATH` if you use pixel-diff motion detection or FFmpeg fallback thumbnails.)*' \
+            "${EXTRA_ARGS[@]}"

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,7 +28,7 @@ import (
 	"feathernvr/internal/storage"
 )
 
-const version = "0.1.0"
+var version = "0.1.0"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to FeatherNVR YAML configuration")
@@ -39,6 +40,13 @@ func main() {
 	forceFlag := flag.Bool("force", false, "Overwrite existing -import-out file (creates a .bak backup)")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	configFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			configFlagSet = true
+		}
+	})
 
 	if *versionFlag {
 		fmt.Printf("feathernvr %s\n", version)
@@ -64,7 +72,19 @@ func main() {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		logger.Fatalf("configuration error: %v", err)
+		if errors.Is(err, os.ErrNotExist) && (!configFlagSet || filepath.Base(*configPath) == "config.yaml") {
+			created, initErr := config.EnsureDefaultConfig(*configPath)
+			if initErr != nil {
+				logger.Fatalf("create default configuration: %v", initErr)
+			}
+			if created {
+				logger.Printf("created starter configuration at %s (add cameras via Web UI '+ Add Camera')", *configPath)
+			}
+			cfg, err = config.Load(*configPath)
+		}
+		if err != nil {
+			logger.Fatalf("configuration error: %v", err)
+		}
 	}
 
 	enabledCams := cfg.EnabledCameras()
@@ -119,107 +139,10 @@ func main() {
 	}()
 
 	recMgr := recorder.NewManager()
-	isapiHubs := make(map[string]*motion.ISAPIHub)
 	ptzMgr := ptz.NewManager()
 
-	for _, cam := range enabledCams {
-		subStream := go2rtc.StreamNameSub(cam)
-		mp4URL := g2.MainMP4URL(cam.ID)
-		frameURL := g2.FrameJPEGURL(subStream)
-		motionInputURL := g2.SubMP4URL(cam)
-
-		rec := recorder.NewCameraRecorder(
-			cam,
-			cfg.Recording,
-			cfg.Storage,
-			mp4URL,
-			frameURL,
-			subStream,
-			db,
-			retention,
-			nil,
-			logger,
-		)
-		rec.SetFFmpeg(cfg.FFmpegBin, job)
-
-		var det motion.Detector
-		switch cam.Motion.Mode {
-		case config.MotionModeONVIF:
-			det = motion.NewONVIFDetector(cam.ID, cam.Motion.ONVIFURL, cam.Motion.Username, cam.Motion.Password, logger)
-		case config.MotionModePixel:
-			det = motion.NewPixelDetector(cam.ID, motionInputURL, cfg.FFmpegBin, cam.Motion, job, logger)
-		case config.MotionModeONVIFOrPixel:
-			det = motion.NewONVIFOrPixelDetector(
-				cam.ID,
-				cam.Motion.ONVIFURL,
-				cam.Motion.Username,
-				cam.Motion.Password,
-				motionInputURL,
-				cfg.FFmpegBin,
-				cam.Motion,
-				job,
-				logger,
-			)
-		case config.MotionModeHikvisionISAPI, config.MotionModeISAPIOrPixel:
-			dvr, ok := cfg.FindDVR(cam.Motion.DVR)
-			if !ok {
-				logger.Fatalf("camera %q references unknown dvr %q", cam.ID, cam.Motion.DVR)
-			}
-			hub, exists := isapiHubs[dvr.ID]
-			if !exists {
-				hub = motion.NewISAPIHub(dvr, logger)
-				isapiHubs[dvr.ID] = hub
-			}
-			if cam.Motion.Mode == config.MotionModeISAPIOrPixel {
-				det = motion.NewISAPIOrPixelDetector(
-					cam.ID,
-					hub,
-					cam.Motion.Channel,
-					motionInputURL,
-					cfg.FFmpegBin,
-					cam.Motion,
-					job,
-					logger,
-				)
-			} else {
-				det = hub.ChannelDetector(cam.ID, cam.Motion.Channel)
-			}
-		case config.MotionModeNone:
-			det = motion.NewNoneDetector()
-		}
-
-		rec.SetDetector(det)
-		recMgr.Register(rec)
-
-		if cam.PTZ.Enabled {
-			ctrl, err := ptz.NewController(cam.PTZ)
-			if err != nil {
-				logger.Printf("[ptz][%s] init warning: %v", cam.ID, err)
-			} else {
-				ptzMgr.Register(cam.ID, ctrl)
-				logger.Printf("[ptz][%s] enabled (%s)", cam.ID, cam.PTZ.Type)
-			}
-		}
-
-		d := det
-		r := rec
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			d.Run(rootCtx, r.HandleMotionEvent)
-		}()
-	}
-
-	for _, hub := range isapiHubs {
-		h := hub
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			h.Run(rootCtx)
-		}()
-	}
-
-	recMgr.StartAll(rootCtx, &wg)
+	camRT := NewCameraRuntime(rootCtx, cfg, *configPath, db, retention, g2, job, recMgr, ptzMgr, logger)
+	camRT.StartInitial()
 
 	go2rtcURL, err := url.Parse(g2.APIBaseURL())
 	if err != nil {
@@ -231,6 +154,7 @@ func main() {
 	}
 	srv.SetConfigPath(*configPath)
 	srv.SetPTZManager(ptzMgr)
+	srv.SetCameraController(camRT)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -254,6 +178,7 @@ func main() {
 	_ = srv.Shutdown(shutdownCtx)
 	cancelShutdown()
 
+	camRT.Wait()
 	wg.Wait()
 	logger.Printf("FeatherNVR stopped cleanly")
 }
