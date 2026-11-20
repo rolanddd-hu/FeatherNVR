@@ -180,6 +180,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download packaged archives
         uses: actions/download-artifact@v4
         with:
@@ -204,6 +207,7 @@ jobs:
             EXTRA_ARGS+=(--prerelease)
           fi
           gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "FeatherNVR ${GITHUB_REF_NAME}" \
             --generate-notes \
             --notes $'## Out-of-the-Box Quick Start\n\nEach archive bundles **FeatherNVR** together with **go2rtc ('"${GO2RTC_VERSION}"$')** — no Go toolchain required:\n\n- **Windows**: Extract the `.zip` and run `feathernvr.exe` (or `.\\scripts\\run.ps1`).\n- **Linux / macOS**: Extract the `.tar.gz` and run `./feathernvr` (or `./scripts/run.sh`).\n\nOn first launch, FeatherNVR creates a starter `config.yaml` automatically. Open `http://localhost:8080` and click **+ Add Camera** to scan your LAN or configure streams.\n\n*(Install `ffmpeg` on `PATH` if you use pixel-diff motion detection or FFmpeg fallback thumbnails.)*' \
