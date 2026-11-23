@@ -13,7 +13,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ import (
 
 	"feathernvr/internal/config"
 	"feathernvr/internal/motion"
+	"feathernvr/internal/procjob"
 	"feathernvr/internal/ptz"
 	"feathernvr/internal/recorder"
 	"feathernvr/internal/storage"
@@ -35,12 +35,15 @@ type Server struct {
 	ptzMgr        *ptz.Manager
 	ptzTimers     ptzTimers
 	camCtrl       CameraController
+	procJob       *procjob.Manager
 	retention     *storage.RetentionManager
 	recorders     *recorder.Manager
 	go2rtcBaseURL *url.URL
 	storageAbs    string
 	startedAt     time.Time
 	logger        *log.Logger
+	frameCache    *frameCache
+	frameSem      chan struct{}
 	handler       http.Handler
 	httpServer    *http.Server
 }
@@ -71,6 +74,8 @@ func New(
 		storageAbs:    storageAbs,
 		startedAt:     time.Now(),
 		logger:        logger,
+		frameCache:    newFrameCache(16 * 1024 * 1024),
+		frameSem:      make(chan struct{}, 2),
 	}
 
 	mux := http.NewServeMux()
@@ -93,6 +98,11 @@ func New(
 // SetConfigPath sets the config file path used to persist runtime settings updates.
 func (s *Server) SetConfigPath(path string) {
 	s.configPath = path
+}
+
+// SetProcessJob attaches the OS process job manager for short-lived preview workers.
+func (s *Server) SetProcessJob(job *procjob.Manager) {
+	s.procJob = job
 }
 
 // Handler returns the root HTTP handler (useful for httptest in unit tests).
@@ -136,6 +146,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/recordings", s.handleListRecordings)
 	mux.HandleFunc("GET /api/recordings/days", s.handleListRecordingDays)
 	mux.HandleFunc("GET /api/recordings/day", s.handleGetRecordingDay)
+	mux.HandleFunc("GET /api/recordings/{id}/frame", s.handleRecordingFrame)
 	mux.HandleFunc("DELETE /api/recordings/{id}", s.handleDeleteRecording)
 	mux.HandleFunc("GET /api/cameras", s.handleListCameras)
 	mux.HandleFunc("POST /api/cameras", s.handleCreateCamera)
@@ -396,6 +407,7 @@ func (s *Server) handleDeleteRecording(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.frameCache.DeleteRecording(id)
 	writeJSON(w, http.StatusOK, map[string]int64{"deleted": id})
 }
 
@@ -523,33 +535,13 @@ func (s *Server) handlePutLayoutSettings(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	rawRel := strings.TrimPrefix(r.URL.Path, "/media/")
-	if rawRel == "" || strings.ContainsRune(rawRel, '\\') || strings.ContainsRune(rawRel, 0) {
-		http.NotFound(w, r)
-		return
-	}
-	for _, seg := range strings.Split(rawRel, "/") {
-		if seg == ".." {
+	abs, _, status := s.resolveSafeStoragePath(rawRel)
+	if status != http.StatusOK {
+		if status == http.StatusForbidden {
 			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
+		} else {
+			http.NotFound(w, r)
 		}
-	}
-
-	cleaned := strings.TrimPrefix(path.Clean("/"+rawRel), "/")
-	if cleaned == "" || cleaned == "." {
-		http.NotFound(w, r)
-		return
-	}
-
-	abs := filepath.Join(s.storageAbs, filepath.FromSlash(cleaned))
-	relCheck, err := filepath.Rel(s.storageAbs, abs)
-	if err != nil || relCheck == "." || strings.HasPrefix(relCheck, "..") || filepath.IsAbs(relCheck) {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-
-	info, err := os.Stat(abs)
-	if err != nil || info.IsDir() {
-		http.NotFound(w, r)
 		return
 	}
 

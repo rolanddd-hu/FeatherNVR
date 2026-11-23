@@ -803,7 +803,9 @@ function createGridPlayer(cam) {
   player.pcConfig = { bundlePolicy: 'max-bundle', iceServers: [] };
   player.mode = 'webrtc,mse,hls,mjpeg';
   player.media = 'video';
-  player.visibilityThreshold = 0.15;
+  // Observe the untransformed outer .cam-tile instead of the scaled player inside .zoom-stage,
+  // otherwise CSS zoom >= ~2.6x shrinks intersectionRatio below 0.15 and triggers VideoRTC disconnect.
+  player.visibilityThreshold = 0;
   player.visibilityCheck = true;
   if (player.video) {
     player.video.style.objectFit = cam.aspect_ratio === 'fill' ? 'cover' : 'contain';
@@ -811,11 +813,27 @@ function createGridPlayer(cam) {
   return player;
 }
 
+const tileVisibilityObserver = 'IntersectionObserver' in window
+  ? new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const ref = state.tiles.get(entry.target.dataset.camId);
+      const player = ref?.player;
+      if (!player || !player.isConnected) continue;
+      if (!entry.isIntersecting) {
+        player.disconnectedCallback?.();
+      } else {
+        player.connectedCallback?.();
+      }
+    }
+  }, { threshold: 0.15 })
+  : null;
+
 // Build/update live grid without tearing down existing video players
 function syncLiveGrid(cameras) {
   const grid = qs('#camera-grid');
   if (!cameras.length) {
     clearSwapSelection();
+    tileVisibilityObserver?.disconnect();
     for (const ref of state.tiles.values()) {
       if (typeof ref.player.ondisconnect === 'function') {
         ref.player.ondisconnect();
@@ -844,6 +862,7 @@ function syncLiveGrid(cameras) {
 
   if (changed) {
     clearSwapSelection();
+    tileVisibilityObserver?.disconnect();
     for (const ref of state.tiles.values()) {
       if (typeof ref.player.ondisconnect === 'function') {
         ref.player.ondisconnect();
@@ -916,6 +935,7 @@ function syncLiveGrid(cameras) {
       });
 
       grid.appendChild(tile);
+      tileVisibilityObserver?.observe(tile);
 
       // Set src after connecting to DOM so isConnected is true.
       player.src = wsStreamURL(desiredStream);
@@ -967,6 +987,8 @@ function syncLiveGrid(cameras) {
       ref.stage.appendChild(nextPlayer);
       nextPlayer.src = wsStreamURL(desiredStream);
       ref.player = nextPlayer;
+      tileVisibilityObserver?.unobserve(ref.el);
+      tileVisibilityObserver?.observe(ref.el);
     } else if (ref.player?.video) {
       ref.player.video.style.objectFit = cam.aspect_ratio === 'fill' ? 'cover' : 'contain';
     }
@@ -1609,10 +1631,12 @@ async function openDayModal(day) {
     tlMode: '24h',
     playbackRate: Number(qs('#clip-speed')?.value || 1),
     muted: false,
+    scrubbing: false,
     pendingSeek: 0,
     pendingAutoplay: true,
   };
 
+  resetTimelineScrubAndPreview(false);
   resetClipDeck();
   qs('#btn-clip-mute').textContent = 'Mute';
   state.clipZoomCtrl?.reset();
@@ -1933,7 +1957,7 @@ function findClipForUnix(session, unix) {
   return { index: clips.length - 1, offset: 0 };
 }
 
-function seekDayTimeline(targetUnix) {
+function seekDayTimeline(targetUnix, autoplay = true) {
   const session = state.daySession;
   if (!session || !session.clips.length) return;
   const hit = findClipForUnix(session, targetUnix);
@@ -1941,14 +1965,29 @@ function seekDayTimeline(targetUnix) {
   if (hit.index === session.index && video?.readyState >= 1) {
     const maxT = Number.isFinite(video.duration) && video.duration > 0 ? Math.max(0, video.duration - 0.05) : hit.offset;
     video.currentTime = Math.max(0, Math.min(maxT, hit.offset));
-    if (video.paused) {
-      video.play().catch(() => {});
+    if (autoplay) {
+      if (video.paused) {
+        const p = video.play();
+        if (p && typeof p.catch === 'function') {
+          p.catch(() => {
+            session.muted = true;
+            video.muted = true;
+            qs('#btn-clip-mute').textContent = 'Unmute';
+            video.play().catch(() => {});
+          });
+        }
+      }
+    } else if (!video.paused) {
+      video.pause();
     }
     updateDayPlayhead();
   } else {
-    playDayClip(hit.index, hit.offset, true);
+    playDayClip(hit.index, hit.offset, autoplay);
   }
 }
+
+let onActiveClipScrubSeeked = () => {};
+let resetTimelineScrubAndPreview = () => {};
 
 clipDeck.forEach((videoEl) => {
   videoEl.addEventListener('loadedmetadata', () => {
@@ -1979,7 +2018,9 @@ clipDeck.forEach((videoEl) => {
       videoEl.pause();
     }
     updateClipPlayButtons();
-    updateDayPlayhead();
+    if (!session.scrubbing) {
+      updateDayPlayhead();
+    }
     if (videoEl.readyState >= 2) {
       preloadNextClip();
     }
@@ -1992,10 +2033,15 @@ clipDeck.forEach((videoEl) => {
 
   videoEl.addEventListener('timeupdate', () => {
     if (videoEl !== getActiveClipVideo()) return;
+    if (state.daySession?.scrubbing) return;
     updateDayPlayhead();
   });
   videoEl.addEventListener('seeked', () => {
     if (videoEl !== getActiveClipVideo()) return;
+    if (state.daySession?.scrubbing) {
+      onActiveClipScrubSeeked(videoEl);
+      return;
+    }
     updateDayPlayhead();
   });
   videoEl.addEventListener('play', () => {
@@ -2005,7 +2051,9 @@ clipDeck.forEach((videoEl) => {
   videoEl.addEventListener('pause', () => {
     if (videoEl !== getActiveClipVideo()) return;
     updateClipPlayButtons();
-    updateDayPlayhead();
+    if (!state.daySession?.scrubbing) {
+      updateDayPlayhead();
+    }
   });
   videoEl.addEventListener('ended', () => {
     if (videoEl !== getActiveClipVideo()) return;
@@ -2018,14 +2066,310 @@ clipDeck.forEach((videoEl) => {
   });
 });
 
-// Timeline track hover, scrub & desktop mouse-wheel zoom in 24h mode
+// Timeline track hover preview, live draggable scrub & desktop mouse-wheel zoom in 24h mode
 (() => {
   const panel = qs('#day-timeline-panel');
   const track = qs('#day-timeline-track');
   const hover = qs('#day-timeline-hover');
+  const previewMedia = qs('#day-timeline-preview-media');
+  const previewImg = qs('#day-timeline-preview-img');
+  const previewCanvas = qs('#day-timeline-preview-canvas');
+  const hoverLabel = qs('#day-timeline-hover-label');
   if (!track) return;
-  let scrubbing = false;
+
   const MIN_TL_SPAN = 60;
+  const MAX_PREVIEW_CACHE = 120;
+
+  let scrubbing = false;
+  let scrubWasPlaying = false;
+  let scrubWasEnded = false;
+  let scrubPendingOffset = null;
+  let scrubPendingClipTarget = null;
+  let scrubClipSwitchTimer = null;
+  let scrubLatestUnix = null;
+
+  let hoverPreviewTimer = null;
+  let hoverFetchCtrl = null;
+  let currentHoverTarget = null;
+  let displayedClipId = null;
+
+  const previewCache = new Map();
+  const previewVideo = document.createElement('video');
+  previewVideo.muted = true;
+  previewVideo.playsInline = true;
+  previewVideo.preload = 'auto';
+
+  let previewVideoUrl = '';
+  let previewVideoBrokenUrl = '';
+  let previewVideoPendingSeek = null;
+  let previewVideoActiveReq = null;
+
+  function setPreviewCache(key, entry) {
+    if (previewCache.has(key)) {
+      const prev = previewCache.get(key);
+      if (prev?.type === 'objectUrl' && prev.value !== entry.value) {
+        URL.revokeObjectURL(prev.value);
+      }
+      previewCache.delete(key);
+    }
+    previewCache.set(key, entry);
+    while (previewCache.size > MAX_PREVIEW_CACHE) {
+      const oldestKey = previewCache.keys().next().value;
+      const oldest = previewCache.get(oldestKey);
+      previewCache.delete(oldestKey);
+      if (oldest?.type === 'objectUrl') {
+        URL.revokeObjectURL(oldest.value);
+      }
+    }
+  }
+
+  function clearPreviewCache() {
+    for (const entry of previewCache.values()) {
+      if (entry?.type === 'objectUrl') {
+        URL.revokeObjectURL(entry.value);
+      }
+    }
+    previewCache.clear();
+  }
+
+  function showPreviewImage(src) {
+    if (!previewImg) return;
+    previewCanvas?.classList.add('hidden');
+    if (src) {
+      if (previewImg.getAttribute('src') !== src) {
+        previewImg.src = src;
+      }
+      previewImg.classList.remove('hidden');
+    } else {
+      previewImg.removeAttribute('src');
+      previewImg.classList.add('hidden');
+    }
+  }
+
+  function showPreviewCanvas() {
+    previewImg?.classList.add('hidden');
+    previewCanvas?.classList.remove('hidden');
+  }
+
+  function hidePreviewMedia() {
+    previewMedia?.classList.add('hidden');
+    hover?.classList.remove('has-preview');
+  }
+
+  function cancelPendingHoverPreview() {
+    if (hoverPreviewTimer) {
+      clearTimeout(hoverPreviewTimer);
+      hoverPreviewTimer = null;
+    }
+    if (hoverFetchCtrl) {
+      hoverFetchCtrl.abort();
+      hoverFetchCtrl = null;
+    }
+    previewVideoPendingSeek = null;
+    previewVideoActiveReq = null;
+  }
+
+  function drawVideoToPreviewCanvas(videoEl) {
+    if (!previewCanvas || !videoEl || !videoEl.videoWidth || !videoEl.videoHeight) {
+      return false;
+    }
+    const ctx = previewCanvas.getContext('2d');
+    if (!ctx) return false;
+    const cw = previewCanvas.width;
+    const ch = previewCanvas.height;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cw, ch);
+    const scale = Math.min(cw / videoEl.videoWidth, ch / videoEl.videoHeight);
+    const dw = videoEl.videoWidth * scale;
+    const dh = videoEl.videoHeight * scale;
+    const dx = (cw - dw) / 2;
+    const dy = (ch - dh) / 2;
+    ctx.drawImage(videoEl, dx, dy, dw, dh);
+    return true;
+  }
+
+  function renderPreviewVideoFrame(req) {
+    if (!req || !drawVideoToPreviewCanvas(previewVideo)) return;
+    try {
+      const dataUrl = previewCanvas.toDataURL('image/jpeg', 0.72);
+      setPreviewCache(req.cacheKey, { type: 'dataUrl', value: dataUrl });
+    } catch {}
+    if (!scrubbing && state.daySession && currentHoverTarget?.clipId === req.clipId) {
+      showPreviewCanvas();
+      displayedClipId = req.clipId;
+    }
+  }
+
+  function seekPreviewVideo(req) {
+    if (!req || previewVideoUrl !== req.videoUrl) return;
+    if (previewVideo.readyState < 2) {
+      previewVideoPendingSeek = req;
+      return;
+    }
+    const dur = Number.isFinite(previewVideo.duration) && previewVideo.duration > 0
+      ? Math.max(0, previewVideo.duration - 0.05)
+      : req.qSec;
+    const clamped = Math.max(0, Math.min(dur, req.qSec));
+    if (previewVideo.seeking) {
+      previewVideoPendingSeek = req;
+      return;
+    }
+    previewVideoPendingSeek = null;
+    previewVideoActiveReq = req;
+    if (Math.abs(previewVideo.currentTime - clamped) < 0.02) {
+      previewVideoActiveReq = null;
+      renderPreviewVideoFrame(req);
+      return;
+    }
+    previewVideo.currentTime = clamped;
+  }
+
+  previewVideo.addEventListener('loadeddata', () => {
+    if (previewVideoPendingSeek && previewVideoPendingSeek.videoUrl === previewVideoUrl) {
+      const req = previewVideoPendingSeek;
+      previewVideoPendingSeek = null;
+      seekPreviewVideo(req);
+    }
+  });
+
+  previewVideo.addEventListener('seeked', () => {
+    if (previewVideoPendingSeek && previewVideoPendingSeek.videoUrl === previewVideoUrl) {
+      const nextReq = previewVideoPendingSeek;
+      previewVideoPendingSeek = null;
+      seekPreviewVideo(nextReq);
+      return;
+    }
+    const req = previewVideoActiveReq;
+    previewVideoActiveReq = null;
+    if (req && req.videoUrl === previewVideoUrl) {
+      renderPreviewVideoFrame(req);
+    }
+  });
+
+  previewVideo.addEventListener('error', () => {
+    if (!previewVideoUrl) return;
+    previewVideoBrokenUrl = previewVideoUrl;
+    previewVideoUrl = '';
+    previewVideoPendingSeek = null;
+    previewVideoActiveReq = null;
+    if (!scrubbing && currentHoverTarget && currentHoverTarget.clip?.video_url === previewVideoBrokenUrl) {
+      fetchServerPreviewFrame(currentHoverTarget);
+    }
+  });
+
+  function requestClientPreviewFrame(target) {
+    if (!target || scrubbing || !state.daySession || currentHoverTarget?.cacheKey !== target.cacheKey) {
+      return;
+    }
+    const videoUrl = target.clip?.video_url;
+    if (!videoUrl || previewVideoBrokenUrl === videoUrl) {
+      fetchServerPreviewFrame(target);
+      return;
+    }
+    const req = {
+      clipId: target.clipId,
+      cacheKey: target.cacheKey,
+      qSec: target.qSec,
+      videoUrl,
+    };
+    if (previewVideoUrl !== videoUrl) {
+      previewVideoUrl = videoUrl;
+      previewVideoPendingSeek = req;
+      previewVideoActiveReq = null;
+      previewVideo.src = videoUrl;
+      previewVideo.load();
+      return;
+    }
+    seekPreviewVideo(req);
+  }
+
+  async function fetchServerPreviewFrame(target) {
+    if (!target || scrubbing || !state.daySession || currentHoverTarget?.cacheKey !== target.cacheKey) {
+      return;
+    }
+    if (hoverFetchCtrl) {
+      hoverFetchCtrl.abort();
+    }
+    const ctrl = new AbortController();
+    hoverFetchCtrl = ctrl;
+    try {
+      const res = await fetch(
+        `/api/recordings/${encodeURIComponent(target.clipId)}/frame?t=${target.qSec.toFixed(1)}`,
+        { signal: ctrl.signal },
+      );
+      if (!res.ok || ctrl.signal.aborted) return;
+      const blob = await res.blob();
+      if (ctrl.signal.aborted || !blob.size) return;
+      const objUrl = URL.createObjectURL(blob);
+      setPreviewCache(target.cacheKey, { type: 'objectUrl', value: objUrl });
+      if (!scrubbing && state.daySession && currentHoverTarget?.cacheKey === target.cacheKey) {
+        showPreviewImage(objUrl);
+        displayedClipId = target.clipId;
+      }
+    } catch {}
+  }
+
+  function positionHoverPopover(clientX, ratio) {
+    if (!hover) return;
+    hover.classList.remove('hidden');
+    const rect = track.getBoundingClientRect();
+    if (rect.width <= 0) {
+      hover.style.left = `${Math.max(4, Math.min(96, ratio * 100))}%`;
+      return;
+    }
+    const half = (hover.offsetWidth || 0) / 2;
+    const localX = clientX - rect.left;
+    const clampedX = Math.max(half, Math.min(Math.max(half, rect.width - half), localX));
+    hover.style.left = `${clampedX}px`;
+  }
+
+  resetTimelineScrubAndPreview = (clearCache) => {
+    if (scrubClipSwitchTimer) {
+      clearTimeout(scrubClipSwitchTimer);
+      scrubClipSwitchTimer = null;
+    }
+    scrubbing = false;
+    scrubWasPlaying = false;
+    scrubWasEnded = false;
+    scrubPendingOffset = null;
+    scrubPendingClipTarget = null;
+    scrubLatestUnix = null;
+    if (state.daySession) {
+      state.daySession.scrubbing = false;
+    }
+    track.classList.remove('scrubbing');
+
+    cancelPendingHoverPreview();
+    currentHoverTarget = null;
+    displayedClipId = null;
+    hidePreviewMedia();
+    showPreviewImage('');
+    hover?.classList.add('hidden');
+
+    previewVideo.pause();
+    previewVideoUrl = '';
+    previewVideoBrokenUrl = '';
+    previewVideo.removeAttribute('src');
+    previewVideo.load();
+
+    if (clearCache) {
+      clearPreviewCache();
+    }
+  };
+
+  onActiveClipScrubSeeked = (videoEl) => {
+    if (!scrubbing || !state.daySession || videoEl !== getActiveClipVideo()) return;
+    if (scrubPendingOffset === null) return;
+    const next = scrubPendingOffset;
+    scrubPendingOffset = null;
+    const maxT = Number.isFinite(videoEl.duration) && videoEl.duration > 0
+      ? Math.max(0, videoEl.duration - 0.05)
+      : next;
+    const target = Math.max(0, Math.min(maxT, next));
+    if (Math.abs(videoEl.currentTime - target) > 0.04) {
+      videoEl.currentTime = target;
+    }
+  };
 
   function clientXToInfo(clientX) {
     const session = state.daySession;
@@ -2039,6 +2383,11 @@ clipDeck.forEach((videoEl) => {
   function updateHover(clientX) {
     const session = state.daySession;
     if (!session || !hover) return;
+    if (isMobileViewport() && !scrubbing) {
+      hover.classList.add('hidden');
+      return;
+    }
+
     const { ratio, unix } = clientXToInfo(clientX);
     let label = formatClockTime(unix);
     const hitIdx = session.clips.findIndex((c) => {
@@ -2048,45 +2397,208 @@ clipDeck.forEach((videoEl) => {
     if (hitIdx >= 0) {
       label += ` · Clip ${hitIdx + 1}`;
     }
-    hover.textContent = label;
-    hover.style.left = `${Math.max(4, Math.min(96, ratio * 100))}%`;
-    hover.classList.remove('hidden');
+    if (hoverLabel) {
+      hoverLabel.textContent = label;
+    } else {
+      hover.textContent = label;
+    }
+
+    if (scrubbing || hitIdx < 0 || isMobileViewport()) {
+      cancelPendingHoverPreview();
+      currentHoverTarget = null;
+      displayedClipId = null;
+      hidePreviewMedia();
+      positionHoverPopover(clientX, ratio);
+      return;
+    }
+
+    const clip = session.clips[hitIdx];
+    const clipDur = Math.max(0.1, Number(clip.duration_sec) || Math.max(1, (clip.end_time || clip.start_time) - clip.start_time));
+    const offsetSec = Math.max(0, Math.min(clipDur, unix - clip.start_time));
+    const bucket = Math.round(offsetSec * 2);
+    const qSec = bucket / 2;
+    const cacheKey = `${clip.id}:${bucket}`;
+    const prevKey = currentHoverTarget?.cacheKey;
+
+    currentHoverTarget = { clipId: clip.id, clip, hitIdx, qSec, cacheKey };
+    previewMedia?.classList.remove('hidden');
+    hover.classList.add('has-preview');
+
+    const cached = previewCache.get(cacheKey);
+    if (cached) {
+      previewCache.delete(cacheKey);
+      previewCache.set(cacheKey, cached);
+      showPreviewImage(cached.value);
+      displayedClipId = clip.id;
+      cancelPendingHoverPreview();
+      positionHoverPopover(clientX, ratio);
+      return;
+    }
+
+    if (displayedClipId !== clip.id) {
+      showPreviewImage(clip.thumb_url || '');
+      displayedClipId = clip.id;
+    }
+    positionHoverPopover(clientX, ratio);
+
+    if (prevKey === cacheKey) {
+      return;
+    }
+    cancelPendingHoverPreview();
+
+    if (qSec < 1 && clip.thumb_url && hitIdx !== session.index) {
+      return;
+    }
+    if (hitIdx === session.index && clip.video_url && previewVideoBrokenUrl !== clip.video_url) {
+      const target = currentHoverTarget;
+      hoverPreviewTimer = setTimeout(() => {
+        hoverPreviewTimer = null;
+        requestClientPreviewFrame(target);
+      }, 60);
+    } else {
+      const target = currentHoverTarget;
+      hoverPreviewTimer = setTimeout(() => {
+        hoverPreviewTimer = null;
+        fetchServerPreviewFrame(target);
+      }, 140);
+    }
+  }
+
+  function applyLiveScrub(unix, immediateSwitch) {
+    const session = state.daySession;
+    if (!session || !session.clips.length) return;
+    const hit = findClipForUnix(session, unix);
+    const video = getActiveClipVideo();
+
+    if (hit.index === session.index) {
+      if (scrubClipSwitchTimer) {
+        clearTimeout(scrubClipSwitchTimer);
+        scrubClipSwitchTimer = null;
+      }
+      scrubPendingClipTarget = null;
+      if (video && video.readyState >= 1) {
+        const maxT = Number.isFinite(video.duration) && video.duration > 0
+          ? Math.max(0, video.duration - 0.05)
+          : hit.offset;
+        const target = Math.max(0, Math.min(maxT, hit.offset));
+        if (video.seeking) {
+          scrubPendingOffset = target;
+        } else if (Math.abs(video.currentTime - target) > 0.04) {
+          scrubPendingOffset = null;
+          video.currentTime = target;
+        }
+      } else {
+        session.pendingSeek = hit.offset;
+      }
+    } else {
+      scrubPendingOffset = null;
+      scrubPendingClipTarget = { index: hit.index, offset: hit.offset };
+      if (immediateSwitch) {
+        if (scrubClipSwitchTimer) {
+          clearTimeout(scrubClipSwitchTimer);
+          scrubClipSwitchTimer = null;
+        }
+        const target = scrubPendingClipTarget;
+        scrubPendingClipTarget = null;
+        playDayClip(target.index, target.offset, false);
+      } else if (!scrubClipSwitchTimer) {
+        scrubClipSwitchTimer = setTimeout(() => {
+          scrubClipSwitchTimer = null;
+          if (!scrubbing || !state.daySession || !scrubPendingClipTarget) return;
+          const target = scrubPendingClipTarget;
+          scrubPendingClipTarget = null;
+          if (target.index !== state.daySession.index) {
+            playDayClip(target.index, target.offset, false);
+            if (scrubLatestUnix !== null) {
+              updateDayPlayhead(scrubLatestUnix);
+            }
+          }
+        }, 110);
+      }
+    }
+
+    scrubLatestUnix = unix;
+    updateDayPlayhead(unix);
   }
 
   track.addEventListener('pointerdown', (ev) => {
-    if (!state.daySession || ev.button > 0) return;
+    const session = state.daySession;
+    if (!session || ev.button > 0) return;
     ev.preventDefault();
+
+    cancelPendingHoverPreview();
+    currentHoverTarget = null;
+    displayedClipId = null;
+
+    const active = getActiveClipVideo();
+    scrubWasPlaying = Boolean(active && !active.paused && !active.ended);
+    scrubWasEnded = Boolean(active && active.ended);
+    if (active && !active.paused) {
+      active.pause();
+    }
+
     scrubbing = true;
+    session.scrubbing = true;
+    scrubPendingOffset = null;
+    scrubPendingClipTarget = null;
+    track.classList.add('scrubbing');
     try { track.setPointerCapture(ev.pointerId); } catch {}
+
     const { unix } = clientXToInfo(ev.clientX);
     updateHover(ev.clientX);
-    updateDayPlayhead(unix);
+    applyLiveScrub(unix, true);
   });
 
   track.addEventListener('pointermove', (ev) => {
     if (!state.daySession) return;
-    updateHover(ev.clientX);
     if (scrubbing) {
       const { unix } = clientXToInfo(ev.clientX);
-      updateDayPlayhead(unix);
+      updateHover(ev.clientX);
+      applyLiveScrub(unix, false);
+      return;
     }
+    updateHover(ev.clientX);
   });
 
   function finishScrub(ev, cancelled) {
-    if (scrubbing) {
-      scrubbing = false;
-      try { track.releasePointerCapture(ev.pointerId); } catch {}
-      if (!cancelled) {
-        const { unix } = clientXToInfo(ev.clientX);
-        seekDayTimeline(unix);
+    if (!scrubbing) return;
+    if (scrubClipSwitchTimer) {
+      clearTimeout(scrubClipSwitchTimer);
+      scrubClipSwitchTimer = null;
+    }
+    scrubPendingOffset = null;
+    scrubPendingClipTarget = null;
+    scrubLatestUnix = null;
+    scrubbing = false;
+    if (state.daySession) {
+      state.daySession.scrubbing = false;
+    }
+    track.classList.remove('scrubbing');
+    try { track.releasePointerCapture(ev.pointerId); } catch {}
+
+    if (!cancelled) {
+      const { unix } = clientXToInfo(ev.clientX);
+      seekDayTimeline(unix, scrubWasPlaying || scrubWasEnded);
+      if (!isMobileViewport()) {
+        updateHover(ev.clientX);
+      } else {
+        hover?.classList.add('hidden');
       }
+    } else {
+      hover?.classList.add('hidden');
     }
   }
 
   track.addEventListener('pointerup', (ev) => finishScrub(ev, false));
   track.addEventListener('pointercancel', (ev) => finishScrub(ev, true));
   track.addEventListener('pointerleave', () => {
-    if (!scrubbing) hover?.classList.add('hidden');
+    if (!scrubbing) {
+      cancelPendingHoverPreview();
+      currentHoverTarget = null;
+      displayedClipId = null;
+      hidePreviewMedia();
+      hover?.classList.add('hidden');
+    }
   });
 
   (panel || track).addEventListener('wheel', (ev) => {
@@ -2208,6 +2720,7 @@ qs('#btn-clip-fs')?.addEventListener('click', () => {
 function closeClipModal() {
   exitStreamFullscreen(qs('#clip-modal'));
   state.clipZoomCtrl?.reset();
+  resetTimelineScrubAndPreview(true);
   resetClipDeck();
   state.daySession = null;
   qs('#clip-modal').classList.add('hidden');

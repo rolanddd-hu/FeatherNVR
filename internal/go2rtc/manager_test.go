@@ -140,7 +140,7 @@ func TestRenderConfigYAML(t *testing.T) {
 	if got := mgr.SubRTSPURL("main_only"); got != "rtsp://127.0.0.1:18554/main_only_main" {
 		t.Fatalf("SubRTSPURL(main_only) = %q", got)
 	}
-	if got := mgr.MainMP4URL("ptz1"); got != "http://127.0.0.1:11984/api/stream.mp4?src=ptz1_main" {
+	if got := mgr.MainMP4URL("ptz1"); got != "http://127.0.0.1:11984/api/stream.mp4?src=ptz1_main&mp4=all" {
 		t.Fatalf("MainMP4URL(ptz1) = %q", got)
 	}
 	if got := mgr.FrameJPEGURL("ptz1_sub"); got != "http://127.0.0.1:11984/api/frame.jpeg?src=ptz1_sub" {

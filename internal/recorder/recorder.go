@@ -2,6 +2,7 @@ package recorder
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -68,31 +69,77 @@ type CameraRecorder struct {
 
 	ring *fmp4.GOPRingBuffer
 
-	mu               sync.Mutex
-	online           bool
-	lastError        string
-	reconnects       int64
-	bitrateKbps      float64
-	fps              float64
-	initInfo         *fmp4.InitInfo
-	motionActive     bool
-	lastMotionEvent  time.Time
-	recording        bool
-	awaitingKeyframe bool
-	wroteFragments   int
-	clipStart        time.Time
-	firstFragAt      time.Time
-	lastFragAt       time.Time
-	clipFile         *os.File
-	clipBuf          *bufio.Writer
-	clipRelPath      string
-	clipAbsPath      string
-	clipThumbRel     string
-	clipSource       string
-	rebaser          *fmp4.ClipRebaser
-	configRev        uint64
-	cooldownGen      uint64
-	cooldownTimer    *time.Timer
+	mu                  sync.Mutex
+	online              bool
+	lastError           string
+	reconnects          int64
+	bitrateKbps         float64
+	fps                 float64
+	initInfo            *fmp4.InitInfo
+	motionActive        bool
+	lastMotionEvent     time.Time
+	recording           bool
+	awaitingKeyframe    bool
+	wroteFragments      int
+	wroteAudioFragments int
+	clipHasAudioTrack   bool
+	clipAudioSampleType string
+	clipAudioTimescale  uint32
+	clipStart           time.Time
+	firstFragAt         time.Time
+	lastFragAt          time.Time
+	clipFile            *os.File
+	clipBuf             *bufio.Writer
+	clipRelPath         string
+	clipAbsPath         string
+	clipThumbRel        string
+	clipSource          string
+	rebaser             *fmp4.ClipRebaser
+	configRev           uint64
+	cooldownGen         uint64
+	cooldownTimer       *time.Timer
+	finalizeWG          sync.WaitGroup
+}
+
+// audioRemuxSem caps concurrent post-clip FFmpeg audio remux jobs to avoid CPU/disk spikes.
+var audioRemuxSem = make(chan struct{}, 2)
+
+type clipFinalizeJob struct {
+	absPath         string
+	relPath         string
+	thumbRel        string
+	start           time.Time
+	end             time.Time
+	source          string
+	hasAudioTrack   bool
+	audioSampleType string
+	audioTimescale  uint32
+	wroteAudioFrags int
+	ffmpegBin       string
+	job             *procjob.Manager
+}
+
+type limitedWriter struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if w.max > 0 && w.buf.Len() < w.max {
+		rem := w.max - w.buf.Len()
+		if rem > len(p) {
+			rem = len(p)
+		}
+		_, _ = w.buf.Write(p[:rem])
+	}
+	return len(p), nil
+}
+
+func needsAudioRemux(hasAudioTrack bool, sampleType string) bool {
+	if !hasAudioTrack {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(sampleType), "mp4a")
 }
 
 // NewCameraRecorder creates a recorder for one enabled camera.
@@ -204,6 +251,7 @@ func (r *CameraRecorder) finalizeOnShutdown() {
 	r.online = false
 	r.stopRecordingLocked(false)
 	r.mu.Unlock()
+	r.finalizeWG.Wait()
 }
 
 func (r *CameraRecorder) streamOnce(ctx context.Context) error {
@@ -503,6 +551,16 @@ func (r *CameraRecorder) openClipFileLocked(clipStart time.Time, source string) 
 
 	r.recording = true
 	r.wroteFragments = 0
+	r.wroteAudioFragments = 0
+	if r.initInfo != nil && r.initInfo.AudioTrackID != 0 {
+		r.clipHasAudioTrack = true
+		r.clipAudioSampleType = r.initInfo.AudioSampleType
+		r.clipAudioTimescale = r.initInfo.AudioTimescale()
+	} else {
+		r.clipHasAudioTrack = false
+		r.clipAudioSampleType = ""
+		r.clipAudioTimescale = 0
+	}
 	r.clipStart = clipStart
 	r.lastFragAt = clipStart
 	r.clipFile = f
@@ -527,6 +585,9 @@ func (r *CameraRecorder) writeFragmentLocked(frag fmp4.Fragment) error {
 		return err
 	}
 	r.wroteFragments++
+	if frag.IsAudio {
+		r.wroteAudioFragments++
+	}
 	if !frag.ReceivedAt.IsZero() {
 		r.lastFragAt = frag.ReceivedAt
 	}
@@ -546,6 +607,11 @@ func (r *CameraRecorder) abortClipFileLocked() {
 		_ = os.Remove(r.clipAbsPath)
 	}
 	r.recording = false
+	r.wroteFragments = 0
+	r.wroteAudioFragments = 0
+	r.clipHasAudioTrack = false
+	r.clipAudioSampleType = ""
+	r.clipAudioTimescale = 0
 	r.clipFile = nil
 	r.clipBuf = nil
 	r.clipAbsPath = ""
@@ -601,15 +667,28 @@ func (r *CameraRecorder) stopRecordingLocked(keepFile bool) {
 		_ = r.clipFile.Close()
 	}
 
-	absPath := r.clipAbsPath
-	relPath := r.clipRelPath
-	thumbRel := r.clipThumbRel
-	start := r.clipStart
-	end := r.lastFragAt
-	source := r.clipSource
+	j := clipFinalizeJob{
+		absPath:         r.clipAbsPath,
+		relPath:         r.clipRelPath,
+		thumbRel:        r.clipThumbRel,
+		start:           r.clipStart,
+		end:             r.lastFragAt,
+		source:          r.clipSource,
+		hasAudioTrack:   r.clipHasAudioTrack,
+		audioSampleType: r.clipAudioSampleType,
+		audioTimescale:  r.clipAudioTimescale,
+		wroteAudioFrags: r.wroteAudioFragments,
+		ffmpegBin:       r.ffmpegBin,
+		job:             r.job,
+	}
 	wrote := r.wroteFragments
 
 	r.recording = false
+	r.wroteFragments = 0
+	r.wroteAudioFragments = 0
+	r.clipHasAudioTrack = false
+	r.clipAudioSampleType = ""
+	r.clipAudioTimescale = 0
 	r.clipFile = nil
 	r.clipBuf = nil
 	r.clipAbsPath = ""
@@ -617,24 +696,125 @@ func (r *CameraRecorder) stopRecordingLocked(keepFile bool) {
 	r.rebaser = nil
 
 	if wrote == 0 && !keepFile {
-		if absPath != "" {
-			_ = os.Remove(absPath)
+		if j.absPath != "" {
+			_ = os.Remove(j.absPath)
 		}
 		return
 	}
 
-	st, err := os.Stat(absPath)
+	st, err := os.Stat(j.absPath)
 	if err != nil || st.Size() == 0 {
-		if absPath != "" {
-			_ = os.Remove(absPath)
+		if j.absPath != "" {
+			_ = os.Remove(j.absPath)
 		}
 		return
 	}
 
-	if end.Before(start) {
+	if needsAudioRemux(j.hasAudioTrack, j.audioSampleType) && strings.TrimSpace(j.ffmpegBin) != "" {
+		r.finalizeWG.Add(1)
+		go func(job clipFinalizeJob) {
+			defer r.finalizeWG.Done()
+			r.remuxClipAudio(job)
+			r.commitFinalizedClip(job)
+		}(j)
+		return
+	}
+
+	r.commitFinalizedClip(j)
+}
+
+func (r *CameraRecorder) remuxClipAudio(j clipFinalizeJob) {
+	audioRemuxSem <- struct{}{}
+	defer func() { <-audioRemuxSem }()
+
+	tmpAbs := j.absPath + ".tmp"
+	_ = os.Remove(tmpAbs)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-threads", "1",
+		"-i", j.absPath,
+	}
+	if j.wroteAudioFrags > 0 {
+		args = append(args, "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy", "-c:a", "aac")
+		if j.audioTimescale > 0 && j.audioTimescale < 16000 {
+			args = append(args, "-ar", "16000", "-b:a", "48k")
+		} else {
+			args = append(args, "-b:a", "64k")
+		}
+	} else {
+		args = append(args, "-map", "0:v:0", "-c:v", "copy")
+	}
+	args = append(args, "-movflags", "+faststart", "-f", "mp4", "-y", tmpAbs)
+
+	var errOut limitedWriter
+	errOut.max = 2048
+
+	cmd := exec.CommandContext(ctx, j.ffmpegBin, args...)
+	cmd.Stderr = &errOut
+	if err := cmd.Start(); err != nil {
+		r.logger.Printf("[recorder][%s] audio remux start failed for %s: %v", r.cam.ID, j.relPath, err)
+		_ = os.Remove(tmpAbs)
+		return
+	}
+	if j.job != nil {
+		_ = j.job.Assign(cmd.Process.Pid)
+	}
+	if err := cmd.Wait(); err != nil {
+		detail := strings.TrimSpace(errOut.buf.String())
+		if detail != "" {
+			r.logger.Printf("[recorder][%s] audio remux failed for %s (%v): %s", r.cam.ID, j.relPath, err, detail)
+		} else {
+			r.logger.Printf("[recorder][%s] audio remux failed for %s: %v", r.cam.ID, j.relPath, err)
+		}
+		_ = os.Remove(tmpAbs)
+		return
+	}
+
+	st, err := os.Stat(tmpAbs)
+	if err != nil || st.Size() == 0 {
+		r.logger.Printf("[recorder][%s] audio remux produced empty output for %s", r.cam.ID, j.relPath)
+		_ = os.Remove(tmpAbs)
+		return
+	}
+
+	var renameErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		renameErr = os.Rename(tmpAbs, j.absPath)
+		if renameErr == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	r.logger.Printf("[recorder][%s] audio remux rename failed for %s: %v", r.cam.ID, j.relPath, renameErr)
+	_ = os.Remove(tmpAbs)
+}
+
+func (r *CameraRecorder) commitFinalizedClip(j clipFinalizeJob) {
+	st, err := os.Stat(j.absPath)
+	if err != nil || st.Size() == 0 {
+		if j.absPath != "" {
+			_ = os.Remove(j.absPath)
+		}
+		return
+	}
+
+	thumbRel := j.thumbRel
+	if thumbRel == "" {
+		thumbAbs := strings.TrimSuffix(j.absPath, filepath.Ext(j.absPath)) + ".jpg"
+		if thumbSt, thumbErr := os.Stat(thumbAbs); thumbErr == nil && !thumbSt.IsDir() && thumbSt.Size() > 0 {
+			thumbRel = strings.TrimSuffix(j.relPath, filepath.Ext(j.relPath)) + ".jpg"
+		}
+	}
+
+	end := j.end
+	if end.Before(j.start) {
 		end = time.Now()
 	}
-	dur := end.Sub(start).Seconds()
+	dur := end.Sub(j.start).Seconds()
 	if dur < 0.1 {
 		dur = 0.1
 	}
@@ -642,13 +822,13 @@ func (r *CameraRecorder) stopRecordingLocked(keepFile bool) {
 	rec := &storage.Recording{
 		CameraID:      r.cam.ID,
 		CameraName:    r.cam.Name,
-		StartTime:     start.Unix(),
+		StartTime:     j.start.Unix(),
 		EndTime:       end.Unix(),
 		DurationSec:   dur,
-		FilePath:      relPath,
+		FilePath:      j.relPath,
 		ThumbPath:     thumbRel,
 		SizeBytes:     st.Size(),
-		TriggerSource: source,
+		TriggerSource: j.source,
 	}
 
 	if r.db != nil {
@@ -659,14 +839,14 @@ func (r *CameraRecorder) stopRecordingLocked(keepFile bool) {
 			r.logger.Printf("[recorder][%s] sqlite insert error: %v", r.cam.ID, insErr)
 		}
 	}
-	if thumbRel == "" && r.ffmpegBin != "" {
-		r.spawnFFmpegThumbnailFallback(absPath, relPath, r.ffmpegBin, r.job)
+	if thumbRel == "" && j.ffmpegBin != "" {
+		r.spawnFFmpegThumbnailFallback(j.absPath, j.relPath, j.ffmpegBin, j.job)
 	}
 	if r.retention != nil {
 		r.retention.Notify()
 	}
 	r.logger.Printf("[recorder][%s] saved clip %s (%.1fs, %.1f KB, trigger=%s)",
-		r.cam.ID, relPath, dur, float64(st.Size())/1024.0, source)
+		r.cam.ID, j.relPath, dur, float64(st.Size())/1024.0, j.source)
 }
 
 func (r *CameraRecorder) spawnFFmpegThumbnailFallback(clipAbs, clipRel, ffmpegBin string, job *procjob.Manager) {

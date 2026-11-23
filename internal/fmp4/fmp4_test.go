@@ -254,3 +254,134 @@ func TestGOPRingBufferDurationAndBytes(t *testing.T) {
 		t.Fatalf("expected byte-bounded eviction to retain newest GOP DTS=2, got %+v", snapSmall)
 	}
 }
+
+func buildTestInitWithAudioSample(audioFourCC string, audioTimescale uint32) (ftyp []byte, moov []byte) {
+	ftyp = makeBox("ftyp", []byte("iso5\x00\x00\x02\x00iso5iso6mp41"))
+
+	buildTrak := func(trackID uint32, handler string, timescale uint32, sampleFourCC string) []byte {
+		tkhdBody := make([]byte, 80)
+		binary.BigEndian.PutUint32(tkhdBody[8:12], trackID)
+		tkhd := makeFullBox("tkhd", 0, 3, tkhdBody)
+
+		mdhdBody := make([]byte, 20)
+		binary.BigEndian.PutUint32(mdhdBody[8:12], timescale)
+		mdhd := makeFullBox("mdhd", 0, 0, mdhdBody)
+
+		hdlrBody := make([]byte, 12)
+		copy(hdlrBody[4:8], handler)
+		hdlr := makeFullBox("hdlr", 0, 0, hdlrBody)
+
+		var sampleEntry []byte
+		if handler == "vide" {
+			payload := make([]byte, 78)
+			binary.BigEndian.PutUint16(payload[24:26], 1920)
+			binary.BigEndian.PutUint16(payload[26:28], 1080)
+			sampleEntry = makeBox(sampleFourCC, payload)
+		} else {
+			payload := make([]byte, 28)
+			binary.BigEndian.PutUint16(payload[16:18], 1)
+			binary.BigEndian.PutUint16(payload[18:20], 16)
+			binary.BigEndian.PutUint32(payload[24:28], timescale<<16)
+			sampleEntry = makeBox(sampleFourCC, payload)
+		}
+
+		stsdBody := make([]byte, 4+len(sampleEntry))
+		binary.BigEndian.PutUint32(stsdBody[0:4], 1)
+		copy(stsdBody[4:], sampleEntry)
+		stsd := makeFullBox("stsd", 0, 0, stsdBody)
+		minf := makeBox("minf", makeBox("stbl", stsd))
+		mdia := makeBox("mdia", append(append(mdhd, hdlr...), minf...))
+		return makeBox("trak", append(tkhd, mdia...))
+	}
+
+	trakV := buildTrak(1, "vide", 90000, "avc1")
+	trakA := buildTrak(2, "soun", audioTimescale, audioFourCC)
+	moov = makeBox("moov", append(trakV, trakA...))
+	return ftyp, moov
+}
+
+func buildMultiTrafMoof(seq uint32, videoDTS, audioDTS uint64) []byte {
+	mfhdBody := make([]byte, 4)
+	binary.BigEndian.PutUint32(mfhdBody, seq)
+	mfhd := makeFullBox("mfhd", 0, 0, mfhdBody)
+
+	makeTraf := func(trackID uint32, dur uint32, flags uint32, dts uint64) []byte {
+		tfhdBody := make([]byte, 16)
+		binary.BigEndian.PutUint32(tfhdBody[0:4], trackID)
+		binary.BigEndian.PutUint32(tfhdBody[4:8], dur)
+		binary.BigEndian.PutUint32(tfhdBody[8:12], 512)
+		binary.BigEndian.PutUint32(tfhdBody[12:16], flags)
+		tfhd := makeFullBox("tfhd", 0, 0x020038, tfhdBody)
+
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, dts)
+		tfdt := makeFullBox("tfdt", 1, 0, b)
+
+		trunBody := make([]byte, 8)
+		binary.BigEndian.PutUint32(trunBody[0:4], 1)
+		binary.BigEndian.PutUint32(trunBody[4:8], 64)
+		trun := makeFullBox("trun", 0, 0x000001, trunBody)
+		return makeBox("traf", append(append(tfhd, tfdt...), trun...))
+	}
+
+	trafV := makeTraf(1, 3000, 0x02000000, videoDTS)
+	trafA := makeTraf(2, 1024, 0x02000000, audioDTS)
+	return makeBox("moof", append(append(mfhd, trafV...), trafA...))
+}
+
+func TestParseInitAndMoofAudioMetadata(t *testing.T) {
+	ftypFlac, moovFlac := buildTestInitWithAudioSample("fLaC", 8000)
+	initFlac, err := ParseInit(ftypFlac, moovFlac)
+	if err != nil {
+		t.Fatalf("ParseInit fLaC failed: %v", err)
+	}
+	if initFlac.AudioTrackID != 2 || initFlac.AudioSampleType != "fLaC" || initFlac.AudioTimescale() != 8000 {
+		t.Fatalf("unexpected fLaC audio init metadata: id=%d sample=%q timescale=%d",
+			initFlac.AudioTrackID, initFlac.AudioSampleType, initFlac.AudioTimescale())
+	}
+
+	ftypAAC, moovAAC := buildTestInitWithAudioSample("mp4a", 16000)
+	initAAC, err := ParseInit(ftypAAC, moovAAC)
+	if err != nil {
+		t.Fatalf("ParseInit mp4a failed: %v", err)
+	}
+	if initAAC.AudioTrackID != 2 || initAAC.AudioSampleType != "mp4a" || initAAC.AudioTimescale() != 16000 {
+		t.Fatalf("unexpected mp4a audio init metadata: id=%d sample=%q timescale=%d",
+			initAAC.AudioTrackID, initAAC.AudioSampleType, initAAC.AudioTimescale())
+	}
+
+	var nilInit *InitInfo
+	if nilInit.AudioTimescale() != 0 {
+		t.Fatalf("expected 0 AudioTimescale on nil InitInfo")
+	}
+
+	// Video-only moof -> IsVideo=true, IsAudio=false.
+	moofV := buildTestMoof(1, 1, 3000, 0x02000000, 90000, true)
+	fragV, err := ParseMoof(moofV, initFlac)
+	if err != nil {
+		t.Fatalf("ParseMoof video-only failed: %v", err)
+	}
+	if !fragV.IsVideo || fragV.IsAudio || !fragV.IsKeyframe {
+		t.Fatalf("expected video-only keyframe fragment, got %+v", fragV)
+	}
+
+	// Audio-only moof -> IsVideo=false, IsAudio=true.
+	moofA := buildTestMoof(2, 2, 1024, 0x02000000, 8000, true)
+	fragA, err := ParseMoof(moofA, initFlac)
+	if err != nil {
+		t.Fatalf("ParseMoof audio-only failed: %v", err)
+	}
+	if fragA.IsVideo || !fragA.IsAudio || fragA.IsKeyframe {
+		t.Fatalf("expected audio-only fragment, got %+v", fragA)
+	}
+
+	// Combined video+audio multi-traf moof -> IsVideo=true and IsAudio=true.
+	moofBoth := buildMultiTrafMoof(3, 93000, 9024)
+	fragBoth, err := ParseMoof(moofBoth, initFlac)
+	if err != nil {
+		t.Fatalf("ParseMoof multi-traf failed: %v", err)
+	}
+	if !fragBoth.IsVideo || !fragBoth.IsAudio || !fragBoth.IsKeyframe || fragBoth.TrackID != 1 {
+		t.Fatalf("expected combined video+audio keyframe fragment, got %+v", fragBoth)
+	}
+}

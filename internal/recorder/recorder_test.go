@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -235,5 +237,293 @@ func TestRecorderPreBufferTriggerAndRebase(t *testing.T) {
 	}
 	if !frag1.IsKeyframe || frag1.DTS != 0 {
 		t.Fatalf("expected first fragment in clip to be keyframe with rebased DTS=0, got keyframe=%v dts=%d", frag1.IsKeyframe, frag1.DTS)
+	}
+}
+
+func TestNeedsAudioRemux(t *testing.T) {
+	cases := []struct {
+		name       string
+		hasAudio   bool
+		sampleType string
+		want       bool
+	}{
+		{name: "video_only", hasAudio: false, sampleType: "", want: false},
+		{name: "native_aac_mp4a", hasAudio: true, sampleType: "mp4a", want: false},
+		{name: "native_aac_uppercase", hasAudio: true, sampleType: "MP4A", want: false},
+		{name: "flac_needs_remux", hasAudio: true, sampleType: "fLaC", want: true},
+		{name: "opus_needs_remux", hasAudio: true, sampleType: "Opus", want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := needsAudioRemux(tc.hasAudio, tc.sampleType); got != tc.want {
+				t.Fatalf("needsAudioRemux(%v, %q) = %v, want %v", tc.hasAudio, tc.sampleType, got, tc.want)
+			}
+		})
+	}
+}
+
+func buildSyntheticFLACFixture(t *testing.T, ffmpegBin, movflags string) []byte {
+	t.Helper()
+	outPath := filepath.Join(t.TempDir(), "fixture.mp4")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, ffmpegBin,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=black:s=160x90:r=10:d=2",
+		"-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=8000:duration=2",
+		"-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "5",
+		"-c:a", "flac", "-strict", "-2",
+		"-movflags", movflags,
+		"-f", "mp4", "-y", outPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate synthetic fixture failed (%v): %s", err, string(out))
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read synthetic fixture: %v", err)
+	}
+	return data
+}
+
+func runRecorderWithFixture(t *testing.T, ffmpegBin string, streamBytes []byte) (string, *fmp4.InitInfo, storage.Recording) {
+	t.Helper()
+	root := t.TempDir()
+	recDir := filepath.Join(root, "recordings")
+	db, err := storage.Open(filepath.Join(root, "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	storCfg := config.StorageConfig{
+		Dir:              recDir,
+		MaxGB:            10,
+		HighWatermarkPct: 98,
+		LowWatermarkPct:  92,
+		SweepIntervalSec: 60,
+	}
+	retention := storage.NewRetentionManager(db, storCfg, nil)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/frame.jpeg":
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0xFF, 0xD9})
+		case "/api/stream.mp4":
+			w.Header().Set("Content-Type", "video/mp4")
+			fl, _ := w.(http.Flusher)
+			_, _ = w.Write(streamBytes)
+			if fl != nil {
+				fl.Flush()
+			}
+			<-r.Context().Done()
+		}
+	}))
+	defer srv.Close()
+
+	pre := 2
+	post := 1
+	maxClip := 30
+	cam := config.CameraConfig{
+		ID:            "test_audio_cam",
+		Name:          "Test Audio Cam",
+		MainRTSP:      "rtsp://dummy",
+		PreRecordSec:  &pre,
+		PostRecordSec: &post,
+		MaxClipSec:    &maxClip,
+	}
+	def := config.RecordingConfig{PreRecordSec: 5, PostRecordSec: 10, MaxClipSec: 300, MaxBufferMB: 8}
+
+	rec := NewCameraRecorder(
+		cam, def, storCfg,
+		srv.URL+"/api/stream.mp4?src=test_audio_cam_main&mp4=all",
+		srv.URL+"/api/frame.jpeg?src=test_audio_cam_main",
+		"test_audio_cam_main",
+		db, retention, nil, nil,
+	)
+	rec.SetFFmpeg(ffmpegBin, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rec.Run(ctx)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := rec.Status(); st.Online {
+			if gops, _ := rec.ring.Stats(); gops >= 1 {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !rec.Status().Online {
+		cancel()
+		<-done
+		t.Fatalf("recorder did not become online")
+	}
+
+	rec.Trigger("manual")
+	if !rec.Status().Recording {
+		cancel()
+		<-done
+		t.Fatalf("expected recording=true immediately after Trigger")
+	}
+
+	waitClip := time.Now().Add(10 * time.Second)
+	var list []storage.Recording
+	for time.Now().Before(waitClip) {
+		var total int64
+		list, total, err = db.ListRecordings(context.Background(), cam.ID, "", 10, 0)
+		if err == nil && total >= 1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	cancel()
+	<-done
+
+	if len(list) == 0 {
+		t.Fatalf("expected at least 1 saved clip in SQLite")
+	}
+
+	clipAbs := filepath.Join(recDir, filepath.FromSlash(list[0].FilePath))
+	st, err := os.Stat(clipAbs)
+	if err != nil {
+		t.Fatalf("stat saved clip %s: %v", clipAbs, err)
+	}
+	if list[0].SizeBytes != st.Size() {
+		t.Fatalf("SQLite size_bytes=%d does not match disk size=%d", list[0].SizeBytes, st.Size())
+	}
+	if _, tmpErr := os.Stat(clipAbs + ".tmp"); !os.IsNotExist(tmpErr) {
+		t.Fatalf("expected no lingering .tmp file, stat err=%v", tmpErr)
+	}
+
+	clipBytes, err := os.ReadFile(clipAbs)
+	if err != nil {
+		t.Fatalf("read saved clip: %v", err)
+	}
+	br := bytes.NewReader(clipBytes)
+	var ftypRaw, moovRaw []byte
+	for len(ftypRaw) == 0 || len(moovRaw) == 0 {
+		box, boxErr := fmp4.ReadBox(br)
+		if boxErr != nil {
+			if boxErr == io.EOF {
+				break
+			}
+			t.Fatalf("read box from saved clip: %v", boxErr)
+		}
+		switch box.Type {
+		case "ftyp":
+			ftypRaw = box.Raw
+		case "moov":
+			moovRaw = box.Raw
+		}
+	}
+	if len(ftypRaw) == 0 || len(moovRaw) == 0 {
+		t.Fatalf("saved clip missing ftyp or moov (ftyp=%d moov=%d)", len(ftypRaw), len(moovRaw))
+	}
+	initInfo, err := fmp4.ParseInit(ftypRaw, moovRaw)
+	if err != nil {
+		t.Fatalf("ParseInit on saved clip: %v", err)
+	}
+	return clipAbs, initInfo, list[0]
+}
+
+func TestRecorderRemuxesFLACToAAC(t *testing.T) {
+	ffmpegBin := config.DetectFFmpeg()
+	if ffmpegBin == "" {
+		t.Skip("ffmpeg not found on system")
+	}
+
+	fixture := buildSyntheticFLACFixture(t, ffmpegBin, "frag_keyframe+empty_moov+default_base_moof")
+	_, initInfo, _ := runRecorderWithFixture(t, ffmpegBin, fixture)
+
+	if initInfo.VideoTrackID == 0 {
+		t.Fatalf("expected VideoTrackID != 0")
+	}
+	if initInfo.AudioTrackID == 0 {
+		t.Fatalf("expected AudioTrackID != 0 after FLAC->AAC remux")
+	}
+	if initInfo.AudioSampleType != "mp4a" {
+		t.Fatalf("expected AudioSampleType=%q, got %q", "mp4a", initInfo.AudioSampleType)
+	}
+	if initInfo.AudioTimescale() != 16000 {
+		t.Fatalf("expected AudioTimescale=16000, got %d", initInfo.AudioTimescale())
+	}
+}
+
+func TestRecorderStripsEmptyFLACAudioTrack(t *testing.T) {
+	ffmpegBin := config.DetectFFmpeg()
+	if ffmpegBin == "" {
+		t.Skip("ffmpeg not found on system")
+	}
+
+	fixture := buildSyntheticFLACFixture(t, ffmpegBin, "frag_keyframe+empty_moov+default_base_moof+separate_moof")
+	br := bytes.NewReader(fixture)
+	var out bytes.Buffer
+	var ftypRaw, moovRaw []byte
+	var initInfo *fmp4.InitInfo
+	var pendingMoof []byte
+	keptVideo := 0
+	droppedAudio := 0
+
+	for {
+		box, err := fmp4.ReadBox(br)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read fixture box: %v", err)
+		}
+		switch box.Type {
+		case "ftyp":
+			ftypRaw = box.Raw
+			out.Write(box.Raw)
+		case "moov":
+			moovRaw = box.Raw
+			out.Write(box.Raw)
+			initInfo, err = fmp4.ParseInit(ftypRaw, moovRaw)
+			if err != nil {
+				t.Fatalf("ParseInit fixture: %v", err)
+			}
+		case "moof":
+			pendingMoof = box.Raw
+		case "mdat":
+			if initInfo == nil || len(pendingMoof) == 0 {
+				pendingMoof = nil
+				continue
+			}
+			frag, err := fmp4.ParseMoof(pendingMoof, initInfo)
+			if err != nil {
+				t.Fatalf("ParseMoof fixture: %v", err)
+			}
+			if frag.IsAudio && !frag.IsVideo {
+				droppedAudio++
+				pendingMoof = nil
+				continue
+			}
+			out.Write(pendingMoof)
+			out.Write(box.Raw)
+			keptVideo++
+			pendingMoof = nil
+		}
+	}
+	if keptVideo == 0 || droppedAudio == 0 {
+		t.Fatalf("expected separate video and audio fragments in fixture, got keptVideo=%d droppedAudio=%d", keptVideo, droppedAudio)
+	}
+
+	_, savedInit, _ := runRecorderWithFixture(t, ffmpegBin, out.Bytes())
+	if savedInit.VideoTrackID == 0 {
+		t.Fatalf("expected VideoTrackID != 0")
+	}
+	if savedInit.AudioTrackID != 0 {
+		t.Fatalf("expected empty fLaC audio track to be stripped (AudioTrackID=0), got AudioTrackID=%d (%q)",
+			savedInit.AudioTrackID, savedInit.AudioSampleType)
 	}
 }

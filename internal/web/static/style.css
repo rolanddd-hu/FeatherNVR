@@ -317,6 +317,10 @@ body.fit-mode {
   width: 100%;
   height: 100%;
   transform-origin: center center;
+}
+
+.cam-tile.zoomed .zoom-stage,
+.modal-player-wrap.zoomed .zoom-stage {
   will-change: transform;
 }
 
@@ -1122,6 +1126,8 @@ select, input[type="date"] {
 }
 
 .day-timeline-panel {
+  position: relative;
+  z-index: 10;
   flex-shrink: 0;
   padding: 0.55rem 0.9rem 0.45rem;
   border-top: 1px solid var(--border);
@@ -1152,9 +1158,13 @@ select, input[type="date"] {
   background: #0c1017;
   border: 1px solid var(--border);
   border-radius: 8px;
-  cursor: pointer;
+  cursor: grab;
   touch-action: none;
   overflow: visible;
+}
+
+.tl-track.scrubbing {
+  cursor: grabbing;
 }
 
 .tl-segs {
@@ -1195,18 +1205,26 @@ select, input[type="date"] {
 .tl-playhead::before {
   content: "";
   position: absolute;
-  top: -4px;
+  top: -5px;
   left: 50%;
   transform: translateX(-50%);
-  width: 8px;
-  height: 8px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
   background: #ef4444;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+  transition: transform 0.1s;
+}
+
+.tl-track:hover .tl-playhead::before,
+.tl-track.scrubbing .tl-playhead::before {
+  transform: translateX(-50%) scale(1.2);
 }
 
 .tl-hover {
   position: absolute;
-  bottom: calc(100% + 6px);
+  bottom: calc(100% + 8px);
   transform: translateX(-50%);
   background: rgba(15, 17, 21, 0.95);
   color: #fff;
@@ -1216,7 +1234,44 @@ select, input[type="date"] {
   font-size: 0.72rem;
   white-space: nowrap;
   pointer-events: none;
-  z-index: 6;
+  z-index: 12;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.75);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.tl-hover.has-preview {
+  padding: 4px;
+  gap: 3px;
+  border-radius: 8px;
+}
+
+.tl-preview-media {
+  width: 192px;
+  height: 108px;
+  background: #000;
+  border-radius: 5px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tl-preview-img,
+.tl-preview-canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.tl-hover-label {
+  font-size: 0.72rem;
+  line-height: 1.25;
+  white-space: nowrap;
+  text-align: center;
+  padding: 0 2px;
 }
 
 .tl-ticks {

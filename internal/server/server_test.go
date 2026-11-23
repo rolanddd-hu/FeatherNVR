@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -820,4 +822,123 @@ func itoa(n int64) string {
 func jsonNumber(n int64) string {
 	b, _ := json.Marshal(n)
 	return string(b)
+}
+
+func TestRecordingFrameEndpoint(t *testing.T) {
+	srv, db, recDir := setupTestServer(t, "", "", nil)
+	ctx := context.Background()
+
+	// Invalid IDs -> 400
+	for _, u := range []string{"/api/recordings/abc/frame", "/api/recordings/0/frame"} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, u, nil))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for %s, got %d", u, rr.Code)
+		}
+	}
+
+	// Invalid t query parameter -> 400
+	for _, u := range []string{"/api/recordings/1/frame?t=-1", "/api/recordings/1/frame?t=bad", "/api/recordings/1/frame?t=NaN"} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, u, nil))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for %s, got %d", u, rr.Code)
+		}
+	}
+
+	// Non-existent recording ID -> 404
+	rrMissing := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrMissing, httptest.NewRequest(http.MethodGet, "/api/recordings/99999/frame?t=0", nil))
+	if rrMissing.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing recording, got %d", rrMissing.Code)
+	}
+
+	// Path traversal in recording file_path -> 403
+	outsideSecret := filepath.Join(filepath.Dir(recDir), "secret.txt")
+	if err := os.WriteFile(outsideSecret, []byte("SECRET"), 0o644); err != nil {
+		t.Fatalf("write outside secret: %v", err)
+	}
+	badID, err := db.InsertRecording(ctx, &storage.Recording{
+		CameraID:    "cam_secret",
+		CameraName:  "Driveway",
+		StartTime:   1700000000,
+		EndTime:     1700000010,
+		DurationSec: 10,
+		FilePath:    "../secret.txt",
+		SizeBytes:   6,
+	})
+	if err != nil {
+		t.Fatalf("insert traversal recording: %v", err)
+	}
+	rrTrav := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrTrav, httptest.NewRequest(http.MethodGet, "/api/recordings/"+strconv.FormatInt(badID, 10)+"/frame?t=0", nil))
+	if rrTrav.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for traversal recording path, got %d", rrTrav.Code)
+	}
+
+	ffmpegBin := config.DetectFFmpeg()
+	if ffmpegBin == "" {
+		t.Skip("ffmpeg not found on system")
+	}
+	srv.cfg.FFmpegBin = ffmpegBin
+
+	relMP4 := "cam_secret/2026-11-23/preview.mp4"
+	absMP4 := filepath.Join(recDir, filepath.FromSlash(relMP4))
+	if err := os.MkdirAll(filepath.Dir(absMP4), 0o755); err != nil {
+		t.Fatalf("mkdir clip dir: %v", err)
+	}
+	genCmd := exec.Command(ffmpegBin,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=blue:s=320x180:r=10:d=2",
+		"-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "5",
+		"-movflags", "+faststart", "-f", "mp4", "-y", absMP4,
+	)
+	if out, genErr := genCmd.CombinedOutput(); genErr != nil {
+		t.Fatalf("generate synthetic mp4 failed (%v): %s", genErr, string(out))
+	}
+	st, err := os.Stat(absMP4)
+	if err != nil {
+		t.Fatalf("stat synthetic mp4: %v", err)
+	}
+
+	recID, err := db.InsertRecording(ctx, &storage.Recording{
+		CameraID:      "cam_secret",
+		CameraName:    "Driveway",
+		StartTime:     1700000100,
+		EndTime:       1700000102,
+		DurationSec:   2.0,
+		FilePath:      relMP4,
+		SizeBytes:     st.Size(),
+		TriggerSource: "manual",
+	})
+	if err != nil {
+		t.Fatalf("insert valid recording: %v", err)
+	}
+
+	frameURL := "/api/recordings/" + strconv.FormatInt(recID, 10) + "/frame?t=1.0"
+	rrFrame := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrFrame, httptest.NewRequest(http.MethodGet, frameURL, nil))
+	if rrFrame.Code != http.StatusOK {
+		t.Fatalf("expected 200 on frame extract, got %d: %s", rrFrame.Code, rrFrame.Body.String())
+	}
+	if ct := rrFrame.Header().Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("expected Content-Type image/jpeg, got %q", ct)
+	}
+	jpg := rrFrame.Body.Bytes()
+	if len(jpg) < 4 || jpg[0] != 0xFF || jpg[1] != 0xD8 {
+		t.Fatalf("expected valid JPEG SOI header, got %d bytes", len(jpg))
+	}
+
+	// Remove source MP4 to prove the second identical request is served from frameCache.
+	if err := os.Remove(absMP4); err != nil {
+		t.Fatalf("remove synthetic mp4: %v", err)
+	}
+	rrCached := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rrCached, httptest.NewRequest(http.MethodGet, frameURL, nil))
+	if rrCached.Code != http.StatusOK {
+		t.Fatalf("expected 200 from frameCache after mp4 removal, got %d", rrCached.Code)
+	}
+	if !bytes.Equal(rrCached.Body.Bytes(), jpg) {
+		t.Fatalf("cached JPEG bytes did not match initial response")
+	}
 }

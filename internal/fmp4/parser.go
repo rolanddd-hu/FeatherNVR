@@ -18,12 +18,22 @@ type Box struct {
 
 // InitInfo holds parsed initialization metadata from an ftyp + moov pair.
 type InitInfo struct {
-	Raw          []byte
-	VideoTrackID uint32
-	Timescales   map[uint32]uint32
-	Width        uint32
-	Height       uint32
-	Codec        string
+	Raw             []byte
+	VideoTrackID    uint32
+	AudioTrackID    uint32
+	AudioSampleType string
+	Timescales      map[uint32]uint32
+	Width           uint32
+	Height          uint32
+	Codec           string
+}
+
+// AudioTimescale returns the media timescale (sample rate) of the audio track, or 0 if unavailable.
+func (i *InitInfo) AudioTimescale() uint32 {
+	if i == nil || i.AudioTrackID == 0 {
+		return 0
+	}
+	return i.Timescales[i.AudioTrackID]
 }
 
 // Fragment represents a single moof + mdat media fragment.
@@ -32,6 +42,7 @@ type Fragment struct {
 	Mdat       []byte
 	TrackID    uint32
 	IsVideo    bool
+	IsAudio    bool
 	IsKeyframe bool
 	DTS        uint64
 	Duration   uint32
@@ -282,6 +293,10 @@ func ParseInit(ftyp, moov []byte) (*InitInfo, error) {
 				}
 				info.Codec = mapSampleEntryCodec(sampleType)
 			}
+			if handler == "soun" && info.AudioTrackID == 0 {
+				info.AudioTrackID = trackID
+				info.AudioSampleType = sampleType
+			}
 		}
 		return nil
 	})
@@ -321,6 +336,7 @@ func ParseMoof(moofRaw []byte, init *InitInfo) (Fragment, error) {
 
 	var best Fragment
 	found := false
+	hasAudio := false
 
 	err = iterBoxes(moofRaw, moofHdr, len(moofRaw), func(cb childBox) error {
 		if cb.typ != "traf" {
@@ -434,6 +450,10 @@ func ParseMoof(moofRaw []byte, init *InitInfo) (Fragment, error) {
 		}
 
 		isVideo := init != nil && init.VideoTrackID != 0 && trackID == init.VideoTrackID
+		isAudio := init != nil && init.AudioTrackID != 0 && trackID == init.AudioTrackID
+		if isAudio {
+			hasAudio = true
+		}
 		if !hasSample0Flags && hasDefaultFlags {
 			sample0Flags = defaultFlags
 			hasSample0Flags = true
@@ -447,6 +467,7 @@ func ParseMoof(moofRaw []byte, init *InitInfo) (Fragment, error) {
 			Moof:       moofRaw,
 			TrackID:    trackID,
 			IsVideo:    isVideo,
+			IsAudio:    isAudio,
 			IsKeyframe: isKeyframe,
 			DTS:        dts,
 			Duration:   totalDur,
@@ -462,6 +483,9 @@ func ParseMoof(moofRaw []byte, init *InitInfo) (Fragment, error) {
 	}
 	if !found {
 		return Fragment{}, errors.New("moof contains no traf box")
+	}
+	if hasAudio {
+		best.IsAudio = true
 	}
 	return best, nil
 }

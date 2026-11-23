@@ -343,9 +343,10 @@ func (m *Manager) APIBaseURL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", port)
 }
 
-// MainMP4URL returns the fragmented MP4 stream URL for a camera's main stream.
+// MainMP4URL returns the fragmented MP4 stream URL for a camera's main stream,
+// requesting all supported audio codecs so non-AAC camera tracks (e.g. PCMU/PCMA) are preserved.
 func (m *Manager) MainMP4URL(camID string) string {
-	return fmt.Sprintf("%s/api/stream.mp4?src=%s", m.APIBaseURL(), url.QueryEscape(camID+"_main"))
+	return fmt.Sprintf("%s/api/stream.mp4?src=%s&mp4=all", m.APIBaseURL(), url.QueryEscape(camID+"_main"))
 }
 
 // SubMP4URL returns the fragmented MP4 stream URL for a camera's sub-stream (or main if sub is unset).

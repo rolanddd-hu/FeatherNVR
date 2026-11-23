@@ -230,7 +230,13 @@
         <div id="day-timeline-track" class="tl-track">
           <div id="day-timeline-segs" class="tl-segs"></div>
           <div id="day-timeline-playhead" class="tl-playhead hidden"></div>
-          <div id="day-timeline-hover" class="tl-hover hidden"></div>
+          <div id="day-timeline-hover" class="tl-hover hidden">
+            <div id="day-timeline-preview-media" class="tl-preview-media hidden">
+              <img id="day-timeline-preview-img" class="tl-preview-img hidden" alt="">
+              <canvas id="day-timeline-preview-canvas" class="tl-preview-canvas hidden" width="192" height="108"></canvas>
+            </div>
+            <div id="day-timeline-hover-label" class="tl-hover-label"></div>
+          </div>
         </div>
         <div id="day-timeline-ticks" class="tl-ticks"></div>
       </div>
